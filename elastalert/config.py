@@ -20,6 +20,7 @@ from util import EAException
 from util import ts_to_dt
 from util import unix_to_dt
 from util import unixms_to_dt
+from util import parse_time
 
 # schema for rule yaml
 rule_schema = jsonschema.Draft4Validator(yaml.load(open(os.path.join(os.path.dirname(__file__), 'schema.yaml'))))
@@ -119,6 +120,10 @@ def load_options(rule, conf, args=None):
             rule['kibana4_start_timedelta'] = datetime.timedelta(**rule['kibana4_start_timedelta'])
         if 'kibana4_end_timedelta' in rule:
             rule['kibana4_end_timedelta'] = datetime.timedelta(**rule['kibana4_end_timedelta'])
+        if 'start_time' in rule:
+            rule['start_time'] = parse_time(rule['start_time'])
+        if 'end_time' in rule:
+            rule['end_time'] = parse_time(rule['end_time'])
     except (KeyError, TypeError) as e:
         raise EAException('Invalid time format used: %s' % (e))
 

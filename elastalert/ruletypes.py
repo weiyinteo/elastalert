@@ -448,7 +448,36 @@ class FlatlineRule(FrequencyRule):
         # Dictionary mapping query keys to the first events
         self.first_event = {}
 
+    def add_data(self, data):
+        if 'query_key' in self.rules:
+            qk = self.rules['query_key']
+        else:
+            qk = None
+
+        count = 1
+        if not data:
+            # insert dummy event
+            data = [{self.ts_field: ts_now()}]
+            count = 0
+
+        for event in data:
+            if qk:
+                key = hashable(lookup_es_key(event, qk))
+            else:
+                # If no query_key, we use the key 'all' for all events
+                key = 'all'
+
+            # Store the timestamps of recent occurrences, per key
+            self.occurrences.setdefault(key, EventWindow(self.rules['timeframe'], getTimestamp=self.get_ts)).append((event, count))
+            self.check_for_match(key)
+
     def check_for_match(self, key):
+        now = ts_now().time()
+        start_time = self.rules.get('start_time')
+        end_time = self.rules.get('end_time')
+        if (start_time is not None and now < start_time) or (end_time is not None and now > end_time):
+            return
+
         most_recent_ts = self.get_ts(self.occurrences[key].data[-1])
         if self.first_event.get(key) is None:
             self.first_event[key] = most_recent_ts

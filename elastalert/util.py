@@ -180,3 +180,11 @@ def cronite_datetime_to_timestamp(self, d):
         d = d.replace(tzinfo=None) - d.utcoffset()
 
     return total_seconds((d - datetime.datetime(1970, 1, 1)))
+
+
+def parse_time(timestr):
+    dt = dateutil.parser.parse(timestr)
+    # Implicitly convert local timestamps to UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dateutil.tz.tzutc())
+    return dt.time()
