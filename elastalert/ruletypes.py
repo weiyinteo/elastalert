@@ -478,6 +478,10 @@ class FlatlineRule(FrequencyRule):
         if (start_time is not None and now < start_time) or (end_time is not None and now > end_time):
             return
 
+        weekdays = self.rules.get('weekdays')
+        if weekdays is not None and ts_now().weekday() not in weekdays:
+            return
+
         most_recent_ts = self.get_ts(self.occurrences[key].data[-1])
         if self.first_event.get(key) is None:
             self.first_event[key] = most_recent_ts
