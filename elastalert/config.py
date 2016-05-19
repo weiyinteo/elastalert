@@ -53,7 +53,9 @@ alerts_mapping = {
     'hipchat': alerts.HipChatAlerter,
     'slack': alerts.SlackAlerter,
     'pagerduty': alerts.PagerDutyAlerter,
-    'victorops': alerts.VictorOpsAlerter
+    'victorops': alerts.VictorOpsAlerter,
+    'telegram': alerts.TelegramAlerter,
+    'gitter': alerts.GitterAlerter
 }
 
 
@@ -138,8 +140,17 @@ def load_options(rule, conf, args=None):
     rule.setdefault('use_local_time', True)
     rule.setdefault('es_port', conf.get('es_port'))
     rule.setdefault('es_host', conf.get('es_host'))
+    rule.setdefault('es_username', conf.get('es_username'))
+    rule.setdefault('es_password', conf.get('es_password'))
     rule.setdefault('max_query_size', conf.get('max_query_size'))
+    rule.setdefault('es_conn_timeout', conf.get('es_conn_timeout'))
     rule.setdefault('description', "")
+
+    # Set elasticsearch options from global config
+    if 'es_url_prefix' in conf:
+        rule.setdefault('es_url_prefix', conf.get('es_url_prefix'))
+    if 'use_ssl' in conf:
+        rule.setdefault('use_ssl', conf.get('use_ssl'))
 
     # Set timestamp_type conversion function, used when generating queries and processing hits
     rule['timestamp_type'] = rule['timestamp_type'].strip().lower()
@@ -157,11 +168,18 @@ def load_options(rule, conf, args=None):
 
     # Set email options from global config
     rule.setdefault('smtp_host', conf.get('smtp_host', 'localhost'))
-    if 'smtp_host' in conf:
-        rule.setdefault('smtp_host', conf.get('smtp_port'))
     rule.setdefault('from_addr', conf.get('from_addr', 'ElastAlert'))
+    if 'smtp_port' in conf:
+        rule.setdefault('smtp_port', conf.get('smtp_port'))
+    if 'smtp_ssl' in conf:
+        rule.setdefault('smtp_ssl', conf.get('smtp_ssl'))
+    if 'smtp_auth_file' in conf:
+        rule.setdefault('smtp_auth_file', conf.get('smtp_auth_file'))
     if 'email_reply_to' in conf:
         rule.setdefault('email_reply_to', conf['email_reply_to'])
+
+    # Set slack options from global config
+    rule.setdefault('slack_webhook_url', conf.get('slack_webhook_url'))
 
     # Make sure we have required options
     if required_locals - frozenset(rule.keys()):
