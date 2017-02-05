@@ -15,26 +15,27 @@ from socket import error
 
 import argparse
 import dateutil.tz
-from elasticsearch import RequestsHttpConnection
 import kibana
 import yaml
 from alerts import DebugAlerter
-from auth import Auth
 from config import get_rule_hashes
 from config import load_configuration
 from config import load_rules
 from croniter import croniter
-from elasticsearch.client import Elasticsearch
 from elasticsearch.exceptions import ElasticsearchException
 from enhancements import DropMatchException
+from util import add_raw_postfix
 from util import cronite_datetime_to_timestamp
 from util import dt_to_ts
 from util import EAException
 from util import elastalert_logger
+from util import elasticsearch_client
 from util import format_index
 from util import lookup_es_key
 from util import pretty_ts
+from util import replace_dots_in_field_names
 from util import seconds
+from util import set_es_key
 from util import ts_add
 from util import ts_now
 from util import ts_to_dt
@@ -42,7 +43,7 @@ from util import unix_to_dt
 
 
 class ElastAlerter():
-    """ The main Elastalert runner. This class holds all state about active rules,
+    """ The main ElastAlert runner. This class holds all state about active rules,
     controls when queries are run, and passes information between rules and alerts.
 
     :param args: An argparse arguments instance. Should contain debug and start
@@ -91,6 +92,7 @@ class ElastAlerter():
 
         self.conf = load_rules(self.args)
         self.max_query_size = self.conf['max_query_size']
+        self.scroll_keepalive = self.conf['scroll_keepalive']
         self.rules = self.conf['rules']
         self.writeback_index = self.conf['writeback_index']
         self.run_every = self.conf['run_every']
@@ -110,10 +112,10 @@ class ElastAlerter():
         self.rule_hashes = get_rule_hashes(self.conf, self.args.rule)
         self.starttime = self.args.start
         self.disabled_rules = []
+        self.replace_dots_in_field_names = self.conf.get('replace_dots_in_field_names', False)
 
-        self.es_conn_config = self.build_es_conn_config(self.conf)
-
-        self.writeback_es = self.new_elasticsearch(self.es_conn_config)
+        self.writeback_es = elasticsearch_client(self.conf)
+        self.es_version = self.get_version()
 
         for rule in self.rules:
             self.init_rule(rule)
@@ -121,62 +123,12 @@ class ElastAlerter():
         if self.args.silence:
             self.silence()
 
-    @staticmethod
-    def new_elasticsearch(es_conn_conf):
-        """ returns an Elasticsearch instance configured using an es_conn_config """
-        return Elasticsearch(host=es_conn_conf['es_host'],
-                             port=es_conn_conf['es_port'],
-                             url_prefix=es_conn_conf['es_url_prefix'],
-                             use_ssl=es_conn_conf['use_ssl'],
-                             connection_class=RequestsHttpConnection,
-                             http_auth=es_conn_conf['http_auth'],
-                             timeout=es_conn_conf['es_conn_timeout'])
+    def get_version(self):
+        info = self.writeback_es.info()
+        return info['version']['number']
 
-    @staticmethod
-    def build_es_conn_config(conf):
-        """ Given a conf dictionary w/ raw config properties 'use_ssl', 'es_host', 'es_port'
-        'es_username' and 'es_password', this will return a new dictionary
-        with properly initialized values for 'es_host', 'es_port', 'use_ssl' and 'http_auth' which
-        will be a basicauth username:password formatted string """
-        parsed_conf = {}
-        parsed_conf['use_ssl'] = False
-        parsed_conf['http_auth'] = None
-        parsed_conf['es_username'] = None
-        parsed_conf['es_password'] = None
-        parsed_conf['aws_region'] = None
-        parsed_conf['boto_profile'] = None
-        parsed_conf['es_host'] = conf['es_host']
-        parsed_conf['es_port'] = conf['es_port']
-        parsed_conf['es_url_prefix'] = ''
-        parsed_conf['es_conn_timeout'] = 10
-
-        if 'es_username' in conf:
-            parsed_conf['es_username'] = conf['es_username']
-            parsed_conf['es_password'] = conf['es_password']
-
-        if 'aws_region' in conf:
-            parsed_conf['aws_region'] = conf['aws_region']
-
-        if 'boto_profile' in conf:
-            parsed_conf['boto_profile'] = conf['boto_profile']
-
-        auth = Auth()
-        parsed_conf['http_auth'] = auth(host=conf['es_host'],
-                                        username=parsed_conf['es_username'],
-                                        password=parsed_conf['es_password'],
-                                        aws_region=parsed_conf['aws_region'],
-                                        boto_profile=parsed_conf['boto_profile'])
-
-        if 'use_ssl' in conf:
-            parsed_conf['use_ssl'] = conf['use_ssl']
-
-        if 'es_conn_timeout' in conf:
-            parsed_conf['es_conn_timeout'] = conf['es_conn_timeout']
-
-        if 'es_url_prefix' in conf:
-            parsed_conf['es_url_prefix'] = conf['es_url_prefix']
-
-        return parsed_conf
+    def is_five(self):
+        return self.es_version.startswith('5')
 
     @staticmethod
     def get_index(rule, starttime=None, endtime=None):
@@ -197,15 +149,15 @@ class ElastAlerter():
             return index
 
     @staticmethod
-    def get_query(filters, starttime=None, endtime=None, sort=True, timestamp_field='@timestamp', to_ts_func=dt_to_ts, desc=False):
+    def get_query(filters, starttime=None, endtime=None, sort=True, timestamp_field='@timestamp', to_ts_func=dt_to_ts, desc=False, five=False):
         """ Returns a query dict that will apply a list of filters, filter by
         start and end time, and sort results by timestamp.
 
-        :param filters: A list of elasticsearch filters to use.
+        :param filters: A list of Elasticsearch filters to use.
         :param starttime: A timestamp to use as the start time of the query.
         :param endtime: A timestamp to use as the end time of the query.
         :param sort: If true, sort results by timestamp. (Default True)
-        :return: A query dictionary to pass to elasticsearch.
+        :return: A query dictionary to pass to Elasticsearch.
         """
         starttime = to_ts_func(starttime)
         endtime = to_ts_func(endtime)
@@ -214,18 +166,25 @@ class ElastAlerter():
         if starttime and endtime:
             es_filters['filter']['bool']['must'].insert(0, {'range': {timestamp_field: {'gt': starttime,
                                                                                         'lte': endtime}}})
-        query = {'query': {'filtered': es_filters}}
+        if five:
+            query = {'query': {'bool': es_filters}}
+        else:
+            query = {'query': {'filtered': es_filters}}
         if sort:
             query['sort'] = [{timestamp_field: {'order': 'desc' if desc else 'asc'}}]
         return query
 
     def get_terms_query(self, query, size, field):
         """ Takes a query generated by get_query and outputs a aggregation query """
-        query = query['query']
-        if 'sort' in query:
-            query.pop('sort')
-        query['filtered'].update({'aggs': {'counts': {'terms': {'field': field, 'size': size}}}})
-        aggs_query = {'aggs': query}
+        query_element = query['query']
+        if 'sort' in query_element:
+            query_element.pop('sort')
+        if not self.is_five():
+            query_element['filtered'].update({'aggs': {'counts': {'terms': {'field': field, 'size': size}}}})
+            aggs_query = {'aggs': query_element}
+        else:
+            aggs_query = query
+            aggs_query['aggs'] = {'counts': {'terms': {'field': field, 'size': size}}}
         return aggs_query
 
     def get_index_start(self, index, timestamp_field='@timestamp'):
@@ -263,8 +222,14 @@ class ElastAlerter():
                 # Fields are returned as lists, assume any with length 1 are not arrays in _source
                 # Except sometimes they aren't lists. This is dependent on ES version
                 hit['_source'].setdefault(key, value[0] if type(value) is list and len(value) == 1 else value)
-            hit['_source'][rule['timestamp_field']] = rule['ts_to_dt'](hit['_source'][rule['timestamp_field']])
-            hit[rule['timestamp_field']] = hit['_source'][rule['timestamp_field']]
+
+            # Convert the timestamp to a datetime
+            ts = lookup_es_key(hit['_source'], rule['timestamp_field'])
+            if not ts and not rule["_source_enabled"]:
+                raise EAException("Error: No timestamp was found for hit. '_source_enabled' is set to false, check your mappings for stored fields")
+
+            set_es_key(hit['_source'], rule['timestamp_field'], rule['ts_to_dt'](ts))
+            set_es_key(hit, rule['timestamp_field'], lookup_es_key(hit['_source'], rule['timestamp_field']))
 
             # Tack metadata fields into _source
             for field in ['_id', '_index', '_type']:
@@ -275,25 +240,38 @@ class ElastAlerter():
                 values = [lookup_es_key(hit['_source'], key) for key in rule['compound_query_key']]
                 hit['_source'][rule['query_key']] = ', '.join([unicode(value) for value in values])
 
+            if rule.get('compound_aggregation_key'):
+                values = [lookup_es_key(hit['_source'], key) for key in rule['compound_aggregation_key']]
+                hit['_source'][rule['aggregation_key']] = ', '.join([unicode(value) for value in values])
+
             processed_hits.append(hit['_source'])
 
         return processed_hits
 
-    def get_hits(self, rule, starttime, endtime, index):
-        """ Query elasticsearch for the given rule and return the results.
+    def get_hits(self, rule, starttime, endtime, index, scroll=False):
+        """ Query Elasticsearch for the given rule and return the results.
 
         :param rule: The rule configuration.
         :param starttime: The earliest time to query.
         :param endtime: The latest time to query.
         :return: A list of hits, bounded by rule['max_query_size'].
         """
-        query = self.get_query(rule['filter'], starttime, endtime, timestamp_field=rule['timestamp_field'], to_ts_func=rule['dt_to_ts'])
+        query = self.get_query(rule['filter'], starttime, endtime, timestamp_field=rule['timestamp_field'], to_ts_func=rule['dt_to_ts'], five=self.is_five())
         extra_args = {'_source_include': rule['include']}
+        scroll_keepalive = rule.get('scroll_keepalive', self.scroll_keepalive)
         if not rule.get('_source_enabled'):
-            query['fields'] = rule['include']
+            if self.is_five():
+                query['stored_fields'] = rule['include']
+            else:
+                query['fields'] = rule['include']
             extra_args = {}
+
         try:
-            res = self.current_es.search(index=index, size=rule['max_query_size'], body=query, ignore_unavailable=True, **extra_args)
+            if scroll:
+                res = self.current_es.scroll(scroll_id=rule['scroll_id'], scroll=scroll_keepalive)
+            else:
+                res = self.current_es.search(scroll=scroll_keepalive, index=index, size=rule['max_query_size'], body=query, ignore_unavailable=True, **extra_args)
+                self.total_hits = int(res['hits']['total'])
             logging.debug(str(res))
         except ElasticsearchException as e:
             # Elasticsearch sometimes gives us GIGANTIC error messages
@@ -306,7 +284,13 @@ class ElastAlerter():
         hits = res['hits']['hits']
         self.num_hits += len(hits)
         lt = rule.get('use_local_time')
-        elastalert_logger.info("Queried rule %s from %s to %s: %s hits" % (rule['name'], pretty_ts(starttime, lt), pretty_ts(endtime, lt), len(hits)))
+        status_log = "Queried rule %s from %s to %s: %s / %s hits" % (rule['name'], pretty_ts(starttime, lt), pretty_ts(endtime, lt), self.num_hits, len(hits))
+        if self.total_hits > rule.get('max_query_size', self.max_query_size):
+            elastalert_logger.info("%s (scrolling..)" % status_log)
+            rule['scroll_id'] = res['_scroll_id']
+        else:
+            elastalert_logger.info(status_log)
+
         hits = self.process_hits(rule, hits)
 
         # Record doc_type for use in get_top_counts
@@ -315,7 +299,7 @@ class ElastAlerter():
         return hits
 
     def get_hits_count(self, rule, starttime, endtime, index):
-        """ Query elasticsearch for the count of results and returns a list of timestamps
+        """ Query Elasticsearch for the count of results and returns a list of timestamps
         equal to the endtime. This allows the results to be passed to rules which expect
         an object for each hit.
 
@@ -324,7 +308,7 @@ class ElastAlerter():
         :param endtime: The latest time to query.
         :return: A dictionary mapping timestamps to number of hits for that time period.
         """
-        query = self.get_query(rule['filter'], starttime, endtime, timestamp_field=rule['timestamp_field'], sort=False, to_ts_func=rule['dt_to_ts'])
+        query = self.get_query(rule['filter'], starttime, endtime, timestamp_field=rule['timestamp_field'], sort=False, to_ts_func=rule['dt_to_ts'], five=self.is_five())
 
         try:
             res = self.current_es.count(index=index, doc_type=rule['doc_type'], body=query, ignore_unavailable=True)
@@ -346,15 +330,18 @@ class ElastAlerter():
         if qk:
             filter_key = rule['query_key']
             if rule.get('raw_count_keys', True) and not rule['query_key'].endswith('.raw'):
-                filter_key += '.raw'
+                filter_key = add_raw_postfix(filter_key)
             rule_filter.extend([{'term': {filter_key: qk}}])
-        base_query = self.get_query(rule_filter, starttime, endtime, timestamp_field=rule['timestamp_field'], sort=False, to_ts_func=rule['dt_to_ts'])
+        base_query = self.get_query(rule_filter, starttime, endtime, timestamp_field=rule['timestamp_field'], sort=False, to_ts_func=rule['dt_to_ts'], five=self.is_five())
         if size is None:
             size = rule.get('terms_size', 50)
         query = self.get_terms_query(base_query, size, key)
 
         try:
-            res = self.current_es.search(index=index, doc_type=rule['doc_type'], body=query, search_type='count', ignore_unavailable=True)
+            if not self.is_five():
+                res = self.current_es.search(index=index, doc_type=rule['doc_type'], body=query, search_type='count', ignore_unavailable=True)
+            else:
+                res = self.current_es.search(index=index, doc_type=rule['doc_type'], body=query, size=0, ignore_unavailable=True)
         except ElasticsearchException as e:
             # Elasticsearch sometimes gives us GIGANTIC error messages
             # (so big that they will fill the entire terminal buffer)
@@ -365,7 +352,10 @@ class ElastAlerter():
 
         if 'aggregations' not in res:
             return {}
-        buckets = res['aggregations']['filtered']['counts']['buckets']
+        if not self.is_five():
+            buckets = res['aggregations']['filtered']['counts']['buckets']
+        else:
+            buckets = res['aggregations']['counts']['buckets']
         self.num_hits += len(buckets)
         lt = rule.get('use_local_time')
         elastalert_logger.info('Queried rule %s from %s to %s: %s buckets' % (rule['name'], pretty_ts(starttime, lt), pretty_ts(endtime, lt), len(buckets)))
@@ -378,7 +368,7 @@ class ElastAlerter():
                 continue
 
             # Remember the new data's IDs
-            rule['processed_hits'][event['_id']] = event[rule['timestamp_field']]
+            rule['processed_hits'][event['_id']] = lookup_es_key(event, rule['timestamp_field'])
             new_events.append(event)
 
         return new_events
@@ -388,12 +378,14 @@ class ElastAlerter():
         now = ts_now()
         remove = []
         buffer_time = rule.get('buffer_time', self.buffer_time)
+        if rule.get('query_delay'):
+            buffer_time += rule['query_delay']
         for _id, timestamp in rule['processed_hits'].iteritems():
             if now - timestamp > buffer_time:
                 remove.append(_id)
         map(rule['processed_hits'].pop, remove)
 
-    def run_query(self, rule, start=None, end=None):
+    def run_query(self, rule, start=None, end=None, scroll=False):
         """ Query for the rule and pass all of the results to the RuleType instance.
 
         :param rule: The rule configuration.
@@ -408,15 +400,13 @@ class ElastAlerter():
 
         # Reset hit counter and query
         rule_inst = rule['type']
-        prev_num_hits = self.num_hits
-        max_size = rule.get('max_query_size', self.max_query_size)
         index = self.get_index(rule, start, end)
         if rule.get('use_count_query'):
             data = self.get_hits_count(rule, start, end, index)
         elif rule.get('use_terms_query'):
             data = self.get_hits_terms(rule, start, end, index, rule['query_key'])
         else:
-            data = self.get_hits(rule, start, end, index)
+            data = self.get_hits(rule, start, end, index, scroll)
             if data:
                 data = self.remove_duplicate_events(data, rule)
 
@@ -430,9 +420,16 @@ class ElastAlerter():
                 rule_inst.add_terms_data(data)
             else:
                 rule_inst.add_data(data)
-        # Warn if we hit max_query_size
-        if self.num_hits - prev_num_hits == max_size and not rule.get('use_count_query'):
-            logging.warning("Hit max_query_size (%s) while querying for %s" % (max_size, rule['name']))
+
+        try:
+            if rule.get('scroll_id') and self.num_hits < self.total_hits:
+                self.run_query(rule, start, end, scroll=True)
+        except RuntimeError:
+            # It's possible to scroll far enough to hit max recursive depth
+            pass
+
+        if 'scroll_id' in rule:
+            rule.pop('scroll_id')
 
         return True
 
@@ -442,8 +439,12 @@ class ElastAlerter():
         :param rule: The rule configuration.
         :return: A timestamp or None.
         """
-        query = {'filter': {'term': {'rule_name': '%s' % (rule['name'])}},
-                 'sort': {'@timestamp': {'order': 'desc'}}}
+        sort = {'sort': {'@timestamp': {'order': 'desc'}}}
+        query = {'filter': {'term': {'rule_name': '%s' % (rule['name'])}}}
+        if self.is_five():
+            query = {'query': {'bool': query}}
+        query.update(sort)
+
         try:
             if self.writeback_es:
                 res = self.writeback_es.search(index=self.writeback_index, doc_type='elastalert_status',
@@ -465,7 +466,7 @@ class ElastAlerter():
 
         # This means we are starting fresh
         if 'starttime' not in rule:
-            # Try to get the last run from elasticsearch
+            # Try to get the last run from Elasticsearch
             last_run_end = self.get_starttime(rule)
             if last_run_end:
                 rule['minimum_starttime'] = last_run_end
@@ -495,6 +496,32 @@ class ElastAlerter():
             return rule.get('buffer_time', self.buffer_time)
         return self.run_every
 
+    def get_query_key_value(self, rule, match):
+        # get the value for the match's query_key (or none) to form the key used for the silence_cache.
+        return self.get_named_key_value(rule, match, 'query_key')
+
+    def get_aggregation_key_value(self, rule, match):
+        # get the value for the match's aggregation_key (or none) to form the key used for grouped aggregates.
+        return self.get_named_key_value(rule, match, 'aggregation_key')
+
+    def get_named_key_value(self, rule, match, key_name):
+        # search the match for the key specified in the rule to get the value
+        if key_name in rule:
+            try:
+                key_value = lookup_es_key(match, rule[key_name])
+                if key_value is not None:
+                    # Only do the unicode conversion if we actually found something)
+                    # otherwise we might transform None --> 'None'
+                    key_value = unicode(key_value)
+            except KeyError:
+                # Some matches may not have the specified key
+                # use a special token for these
+                key_value = '_missing'
+        else:
+            key_value = None
+
+        return key_value
+
     def run_rule(self, rule, endtime, starttime=None):
         """ Run a rule for a given time period, including querying and alerting on results.
 
@@ -505,8 +532,7 @@ class ElastAlerter():
         """
         run_start = time.time()
 
-        rule_es_conn_config = self.build_es_conn_config(rule)
-        self.current_es = self.new_elasticsearch(rule_es_conn_config)
+        self.current_es = elasticsearch_client(rule)
         self.current_es_addr = (rule['es_host'], rule['es_port'])
 
         # If there are pending aggregate matches, try processing them
@@ -544,29 +570,34 @@ class ElastAlerter():
         num_matches = len(rule['type'].matches)
         while rule['type'].matches:
             match = rule['type'].matches.pop(0)
+            match['num_hits'] = self.num_hits
+            match['num_matches'] = num_matches
 
             # If realert is set, silence the rule for that duration
             # Silence is cached by query_key, if it exists
             # Default realert time is 0 seconds
+            silence_cache_key = rule['name']
+            query_key_value = self.get_query_key_value(rule, match)
+            if query_key_value is not None:
+                silence_cache_key += '.' + query_key_value
 
-            # concatenate query_key (or none) with rule_name to form silence_cache key
-            if 'query_key' in rule:
-                try:
-                    key = '.' + unicode(lookup_es_key(match, rule['query_key']))
-                except KeyError:
-                    # Some matches may not have a query key
-                    # Use a special token for these to not clobber all alerts
-                    key = '._missing'
-            else:
-                key = ''
-
-            if self.is_silenced(rule['name'] + key) or self.is_silenced(rule['name']):
-                elastalert_logger.info('Ignoring match for silenced rule %s%s' % (rule['name'], key))
+            if self.is_silenced(rule['name'] + "._silence") or self.is_silenced(silence_cache_key):
+                elastalert_logger.info('Ignoring match for silenced rule %s' % (silence_cache_key,))
                 continue
 
             if rule['realert']:
-                next_alert, exponent = self.next_alert_time(rule, rule['name'] + key, ts_now())
-                self.set_realert(rule['name'] + key, next_alert, exponent)
+                next_alert, exponent = self.next_alert_time(rule, silence_cache_key, ts_now())
+                self.set_realert(silence_cache_key, next_alert, exponent)
+
+            if rule.get('run_enhancements_first'):
+                try:
+                    for enhancement in rule['match_enhancements']:
+                        try:
+                            enhancement.process(match)
+                        except EAException as e:
+                            self.handle_error("Error running match enhancement: %s" % (e), {'rule': rule['name']})
+                except DropMatchException:
+                    continue
 
             # If no aggregation, alert immediately
             if not rule['aggregation']:
@@ -595,7 +626,7 @@ class ElastAlerter():
     def init_rule(self, new_rule, new=True):
         ''' Copies some necessary non-config state from an exiting rule to a new rule. '''
         if 'download_dashboard' in new_rule['filter']:
-            # Download filters from kibana and set the rules filters to them
+            # Download filters from Kibana and set the rules filters to them
             db_filters = self.filters_from_kibana(new_rule, new_rule['filter']['download_dashboard'])
             if db_filters is not None:
                 new_rule['filter'] = db_filters
@@ -603,7 +634,8 @@ class ElastAlerter():
                 raise EAException("Could not download filters from %s" % (new_rule['filter']['download_dashboard']))
 
         blank_rule = {'agg_matches': [],
-                      'current_aggregate_id': None,
+                      'aggregate_alert_time': {},
+                      'current_aggregate_id': {},
                       'processed_hits': {}}
         rule = blank_rule
 
@@ -626,6 +658,14 @@ class ElastAlerter():
             if prop not in rule:
                 continue
             new_rule[prop] = rule[prop]
+
+        # In ES5, filters starting with 'query' should have the top wrapper removed
+        if self.is_five():
+            for es_filter in new_rule.get('filter', []):
+                if es_filter.get('query'):
+                    new_filter = es_filter['query']
+                    new_rule['filter'].append(new_filter)
+                    new_rule['filter'].remove(es_filter)
 
         return new_rule
 
@@ -726,7 +766,7 @@ class ElastAlerter():
         """ Run each rule one time """
         # If writeback_es errored, it's disabled until the next query cycle
         if not self.writeback_es:
-            self.writeback_es = self.new_elasticsearch(self.es_conn_config)
+            self.writeback_es = elasticsearch_client(self.conf)
 
         self.send_pending_alerts()
 
@@ -755,13 +795,14 @@ class ElastAlerter():
                                                             self.num_hits, num_matches, self.alerts_sent))
                 self.alerts_sent = 0
 
-            self.remove_old_events(rule)
+                if next_run < datetime.datetime.utcnow():
+                    # We were processing for longer than our refresh interval
+                    # This can happen if --start was specified with a large time period
+                    # or if we are running too slow to process events in real time.
+                    logging.warning("Querying from %s to %s took longer than %s!" % (old_starttime, pretty_ts(endtime, rule.get('use_local_time')),
+                                                                                     self.run_every))
 
-        if next_run < datetime.datetime.utcnow():
-            # We were processing for longer than our refresh interval
-            # This can happen if --start was specified with a large time period
-            # or if we are running too slow to process events in real time.
-            logging.warning("Querying from %s to %s took longer than %s!" % (old_starttime, endtime, self.run_every))
+            self.remove_old_events(rule)
 
         # Only force starttime once
         self.starttime = None
@@ -770,7 +811,7 @@ class ElastAlerter():
             self.load_rule_changes()
 
     def stop(self):
-        """ Stop an elastalert runner that's been started """
+        """ Stop an ElastAlert runner that's been started """
         self.running = False
 
     def sleep_for(self, duration):
@@ -781,14 +822,18 @@ class ElastAlerter():
     def generate_kibana4_db(self, rule, match):
         ''' Creates a link for a kibana4 dashboard which has time set to the match. '''
         db_name = rule.get('use_kibana4_dashboard')
-        start = ts_add(match[rule['timestamp_field']], -rule.get('kibana4_start_timedelta', rule.get('timeframe', datetime.timedelta(minutes=10))))
-        end = ts_add(match[rule['timestamp_field']], rule.get('kibana4_end_timedelta', rule.get('timeframe', datetime.timedelta(minutes=10))))
+        start = ts_add(lookup_es_key(match, rule['timestamp_field']), -rule.get('kibana4_start_timedelta', rule.get('timeframe', datetime.timedelta(minutes=10))))
+        end = ts_add(lookup_es_key(match, rule['timestamp_field']), rule.get('kibana4_end_timedelta', rule.get('timeframe', datetime.timedelta(minutes=10))))
         return kibana.kibana4_dashboard_link(db_name, start, end)
 
     def generate_kibana_db(self, rule, match):
         ''' Uses a template dashboard to upload a temp dashboard showing the match.
         Returns the url to the dashboard. '''
         db = copy.deepcopy(kibana.dashboard_temp)
+
+        # Set timestamp fields to match our rule especially if
+        # we have configured something other than @timestamp
+        kibana.set_timestamp_field(db, rule['timestamp_field'])
 
         # Set filters
         for filter in rule['filter']:
@@ -803,11 +848,11 @@ class ElastAlerter():
         return self.upload_dashboard(db, rule, match)
 
     def upload_dashboard(self, db, rule, match):
-        ''' Uploads a dashboard schema to the kibana-int elasticsearch index associated with rule.
+        ''' Uploads a dashboard schema to the kibana-int Elasticsearch index associated with rule.
         Returns the url to the dashboard. '''
         # Set time range
-        start = ts_add(match[rule['timestamp_field']], -rule.get('timeframe', datetime.timedelta(minutes=10)))
-        end = ts_add(match[rule['timestamp_field']], datetime.timedelta(minutes=10))
+        start = ts_add(lookup_es_key(match, rule['timestamp_field']), -rule.get('timeframe', datetime.timedelta(minutes=10)))
+        end = ts_add(lookup_es_key(match, rule['timestamp_field']), datetime.timedelta(minutes=10))
         kibana.set_time(db, start, end)
 
         # Set dashboard name
@@ -821,6 +866,13 @@ class ElastAlerter():
                     term = {'term': {qk: match[qk]}}
                     kibana.add_filter(db, term)
 
+        # Add filter for aggregation_key value
+        if 'aggregation_key' in rule:
+            for qk in rule.get('compound_aggregation_key', [rule['aggregation_key']]):
+                if qk in match:
+                    term = {'term': {qk: match[qk]}}
+                    kibana.add_filter(db, term)
+
         # Convert to json
         db_js = json.dumps(db)
         db_body = {'user': 'guest',
@@ -829,12 +881,11 @@ class ElastAlerter():
                    'dashboard': db_js}
 
         # Upload
-        rule_es_conn_config = self.build_es_conn_config(rule)
-        es = self.new_elasticsearch(rule_es_conn_config)
+        es = elasticsearch_client(rule)
 
-        res = es.create(index='kibana-int',
-                        doc_type='temp',
-                        body=db_body)
+        res = es.index(index='kibana-int',
+                       doc_type='temp',
+                       body=db_body)
 
         # Return dashboard URL
         kibana_url = rule.get('kibana_url')
@@ -844,9 +895,8 @@ class ElastAlerter():
         return kibana_url + '#/dashboard/temp/%s' % (res['_id'])
 
     def get_dashboard(self, rule, db_name):
-        """ Download dashboard which matches use_kibana_dashboard from elasticsearch. """
-        rule_es_conn_config = self.build_es_conn_config(rule)
-        es = self.new_elasticsearch(rule_es_conn_config)
+        """ Download dashboard which matches use_kibana_dashboard from Elasticsearch. """
+        es = elasticsearch_client(rule)
         if not db_name:
             raise EAException("use_kibana_dashboard undefined")
         query = {'query': {'term': {'_id': db_name}}}
@@ -876,7 +926,7 @@ class ElastAlerter():
         return self.upload_dashboard(dashboard, rule, match)
 
     def filters_from_kibana(self, rule, db_name):
-        """ Downloads a dashboard from kibana and returns corresponding filters, None on error. """
+        """ Downloads a dashboard from Kibana and returns corresponding filters, None on error. """
         try:
             db = rule.get('dashboard_schema')
             if not db:
@@ -887,7 +937,7 @@ class ElastAlerter():
         return filters
 
     def alert(self, matches, rule, alert_time=None):
-        """ Wraps alerting, kibana linking and enhancements in an exception handler """
+        """ Wraps alerting, Kibana linking and enhancements in an exception handler """
         try:
             return self.send_alert(matches, rule, alert_time=alert_time)
         except Exception as e:
@@ -899,6 +949,9 @@ class ElastAlerter():
         :param matches: A list of matches.
         :param rule: A rule configuration.
         """
+        if not matches:
+            return
+
         if alert_time is None:
             alert_time = ts_now()
 
@@ -909,8 +962,8 @@ class ElastAlerter():
                     qk = match[rule['query_key']]
                 else:
                     qk = None
-                start = ts_to_dt(match[rule['timestamp_field']]) - rule.get('timeframe', datetime.timedelta(minutes=10))
-                end = ts_to_dt(match[rule['timestamp_field']]) + datetime.timedelta(minutes=10)
+                start = ts_to_dt(lookup_es_key(match, rule['timestamp_field'])) - rule.get('timeframe', datetime.timedelta(minutes=10))
+                end = ts_to_dt(lookup_es_key(match, rule['timestamp_field'])) + datetime.timedelta(minutes=10)
                 keys = rule.get('top_count_keys')
                 counts = self.get_top_counts(rule, start, end, keys, qk=qk)
                 match.update(counts)
@@ -923,7 +976,7 @@ class ElastAlerter():
                 else:
                     kb_link = self.use_kibana_link(rule, matches[0])
             except EAException as e:
-                self.handle_error("Could not generate kibana dash for %s match: %s" % (rule['name'], e))
+                self.handle_error("Could not generate Kibana dash for %s match: %s" % (rule['name'], e))
             else:
                 if kb_link:
                     matches[0]['kibana_link'] = kb_link
@@ -933,19 +986,20 @@ class ElastAlerter():
             if kb_link:
                 matches[0]['kibana_link'] = kb_link
 
-        for enhancement in rule['match_enhancements']:
-            valid_matches = []
-            for match in matches:
-                try:
-                    enhancement.process(match)
-                    valid_matches.append(match)
-                except DropMatchException as e:
-                    pass
-                except EAException as e:
-                    self.handle_error("Error running match enhancement: %s" % (e), {'rule': rule['name']})
-            matches = valid_matches
-            if not matches:
-                return None
+        if not rule.get('run_enhancements_first'):
+            for enhancement in rule['match_enhancements']:
+                valid_matches = []
+                for match in matches:
+                    try:
+                        enhancement.process(match)
+                        valid_matches.append(match)
+                    except DropMatchException as e:
+                        pass
+                    except EAException as e:
+                        self.handle_error("Error running match enhancement: %s" % (e), {'rule': rule['name']})
+                matches = valid_matches
+                if not matches:
+                    return None
 
         # Don't send real alerts in debug mode
         if self.debug:
@@ -995,23 +1049,31 @@ class ElastAlerter():
         return body
 
     def writeback(self, doc_type, body):
-        # Convert any datetime objects to timestamps
-        for key in body.keys():
-            if isinstance(body[key], datetime.datetime):
-                body[key] = dt_to_ts(body[key])
+        # ES 2.0 - 2.3 does not support dots in field names.
+        if self.replace_dots_in_field_names:
+            writeback_body = replace_dots_in_field_names(body)
+        else:
+            writeback_body = body
+
+        for key in writeback_body.keys():
+            # Convert any datetime objects to timestamps
+            if isinstance(writeback_body[key], datetime.datetime):
+                writeback_body[key] = dt_to_ts(writeback_body[key])
+
         if self.debug:
-            elastalert_logger.info("Skipping writing to ES: %s" % (body))
+            elastalert_logger.info("Skipping writing to ES: %s" % (writeback_body))
             return None
 
-        if '@timestamp' not in body:
-            body['@timestamp'] = dt_to_ts(ts_now())
+        if '@timestamp' not in writeback_body:
+            writeback_body['@timestamp'] = dt_to_ts(ts_now())
+
         if self.writeback_es:
             try:
-                res = self.writeback_es.create(index=self.writeback_index,
-                                               doc_type=doc_type, body=body)
+                res = self.writeback_es.index(index=self.writeback_index,
+                                              doc_type=doc_type, body=body)
                 return res
             except ElasticsearchException as e:
-                logging.exception("Error writing alert info to elasticsearch: %s" % (e))
+                logging.exception("Error writing alert info to Elasticsearch: %s" % (e))
                 self.writeback_es = None
 
     def find_recent_pending_alerts(self, time_limit):
@@ -1022,10 +1084,15 @@ class ElastAlerter():
         # unless there is constantly more than 1000 alerts to send.
 
         # Fetch recent, unsent alerts that aren't part of an aggregate, earlier alerts first.
-        query = {'query': {'query_string': {'query': '!_exists_:aggregate_id AND alert_sent:false'}},
-                 'filter': {'range': {'alert_time': {'from': dt_to_ts(ts_now() - time_limit),
-                                                     'to': dt_to_ts(ts_now())}}},
-                 'sort': {'alert_time': {'order': 'asc'}}}
+        inner_query = {'query_string': {'query': '!_exists_:aggregate_id AND alert_sent:false'}}
+        time_filter = {'range': {'alert_time': {'from': dt_to_ts(ts_now() - time_limit),
+                                                'to': dt_to_ts(ts_now())}}}
+        sort = {'sort': {'alert_time': {'order': 'asc'}}}
+        if self.is_five():
+            query = {'query': {'bool': {'must': inner_query, 'filter': time_filter}}}
+        else:
+            query = {'query': inner_query, 'filter': time_filter}
+        query.update(sort)
         if self.writeback_es:
             try:
                 res = self.writeback_es.search(index=self.writeback_index,
@@ -1034,7 +1101,8 @@ class ElastAlerter():
                                                size=1000)
                 if res['hits']['hits']:
                     return res['hits']['hits']
-            except:  # TODO: Give this a more relevant exception, try:except: is evil.
+            except ElasticsearchException as e:
+                logging.exception("Error finding recent pending alerts: %s %s" % (e, query))
                 pass
         return []
 
@@ -1060,8 +1128,7 @@ class ElastAlerter():
                 continue
 
             # Set current_es for top_count_keys query
-            rule_es_conn_config = self.build_es_conn_config(rule)
-            self.current_es = self.new_elasticsearch(rule_es_conn_config)
+            self.current_es = elasticsearch_client(rule)
             self.current_es_addr = (rule['es_host'], rule['es_port'])
 
             # Send the alert unless it's a future alert
@@ -1070,8 +1137,11 @@ class ElastAlerter():
                 if aggregated_matches:
                     matches = [match_body] + [agg_match['match_body'] for agg_match in aggregated_matches]
                     self.alert(matches, rule, alert_time=alert_time)
-                    if rule['current_aggregate_id'] == _id:
-                        rule['current_aggregate_id'] = None
+                    if rule['current_aggregate_id']:
+                        for qk, id in rule['current_aggregate_id'].iteritems():
+                            if id == _id:
+                                rule['current_aggregate_id'].pop(qk)
+                                break
                 else:
                     self.alert([match_body], rule, alert_time=alert_time)
 
@@ -1086,15 +1156,17 @@ class ElastAlerter():
         # Send in memory aggregated alerts
         for rule in self.rules:
             if rule['agg_matches']:
-                if ts_now() > rule['aggregate_alert_time']:
-                    self.alert(rule['agg_matches'], rule)
-                    rule['agg_matches'] = []
+                for aggregation_key_value, aggregate_alert_time in rule['aggregate_alert_time'].iteritems():
+                    if ts_now() > aggregate_alert_time:
+                        alertable_matches = [agg_match for agg_match in rule['agg_matches'] if self.get_aggregation_key_value(rule, agg_match) == aggregation_key_value]
+                        self.alert(alertable_matches, rule)
+                        rule['agg_matches'] = [agg_match for agg_match in rule['agg_matches'] if self.get_aggregation_key_value(rule, agg_match) != aggregation_key_value]
 
     def get_aggregated_matches(self, _id):
         """ Removes and returns all matches from writeback_es that have aggregate_id == _id """
 
         # XXX if there are more than self.max_aggregation matches, you have big alerts and we will leave entries in ES.
-        query = {'query': {'query_string': {'query': 'aggregate_id:%s' % (_id)}}}
+        query = {'query': {'query_string': {'query': 'aggregate_id:%s' % (_id)}}, 'sort': {'@timestamp': 'asc'}}
         matches = []
         if self.writeback_es:
             try:
@@ -1111,40 +1183,81 @@ class ElastAlerter():
                 self.handle_error("Error fetching aggregated matches: %s" % (e), {'id': _id})
         return matches
 
-    def add_aggregated_alert(self, match, rule):
-        """ Save a match as a pending aggregate alert to elasticsearch. """
-        if (not rule['current_aggregate_id'] or
-                ('aggregate_alert_time' in rule and rule['aggregate_alert_time'] < ts_to_dt(match[rule['timestamp_field']]))):
-            # First match, set alert_time
-            match_time = ts_to_dt(match[rule['timestamp_field']])
-            alert_time = ''
-            if isinstance(rule['aggregation'], dict) and rule['aggregation'].get('schedule'):
-                croniter._datetime_to_timestamp = cronite_datetime_to_timestamp  # For Python 2.6 compatibility
-                try:
-                    iter = croniter(rule['aggregation']['schedule'], ts_now())
-                    alert_time = unix_to_dt(iter.get_next())
-                except Exception as e:
-                    self.handle_error("Error parsing aggregate send time Cron format %s" % (e), rule['aggregation']['schedule'])
-            else:
-                alert_time = match_time + rule['aggregation']
+    def find_pending_aggregate_alert(self, rule, aggregation_key_value=None):
+        query = {'filter': {'bool': {'must': [{'term': {'rule_name': rule['name']}},
+                                              {'range': {'alert_time': {'gt': ts_now()}}},
+                                              {'term': {'alert_sent': 'false'}}],
+                                     'must_not': [{'exists': {'field': 'aggregate_id'}}]}}}
+        if aggregation_key_value:
+            query['filter']['bool']['must'].append({'term': {'aggregate_key': aggregation_key_value}})
+        if self.is_five():
+            query = {'query': {'bool': query}}
+        query['sort'] = {'alert_time': {'order': 'desc'}}
+        if not self.writeback_es:
+            self.writeback_es = elasticsearch_client(self.conf)
+        try:
+            res = self.writeback_es.search(index=self.writeback_index,
+                                           doc_type='elastalert',
+                                           body=query,
+                                           size=1)
+            if len(res['hits']['hits']) == 0:
+                return None
+        except (KeyError, ElasticsearchException) as e:
+            self.handle_error("Error searching for pending aggregated matches: %s" % (e), {'rule_name': rule['name']})
+            return None
 
-            rule['aggregate_alert_time'] = alert_time
-            agg_id = None
-            elastalert_logger.info('New aggregation for %s. next alert at %s.' % (rule['name'], alert_time))
+        return res['hits']['hits'][0]
+
+    def add_aggregated_alert(self, match, rule):
+        """ Save a match as a pending aggregate alert to Elasticsearch. """
+
+        # Optionally include the 'aggregation_key' as a dimension for aggregations
+        aggregation_key_value = self.get_aggregation_key_value(rule, match)
+
+        if (not rule['current_aggregate_id'].get(aggregation_key_value) or
+                ('aggregate_alert_time' in rule and aggregation_key_value in rule['aggregate_alert_time'] and rule['aggregate_alert_time'].get(aggregation_key_value) < ts_to_dt(lookup_es_key(match, rule['timestamp_field'])))):
+
+            # ElastAlert may have restarted while pending alerts exist
+            pending_alert = self.find_pending_aggregate_alert(rule, aggregation_key_value)
+            if pending_alert:
+                alert_time = ts_to_dt(pending_alert['_source']['alert_time'])
+                rule['aggregate_alert_time'][aggregation_key_value] = alert_time
+                agg_id = pending_alert['_id']
+                rule['current_aggregate_id'] = {aggregation_key_value: agg_id}
+                elastalert_logger.info('Adding alert for %s to aggregation(id: %s, aggregation_key: %s), next alert at %s' % (rule['name'], agg_id, aggregation_key_value, alert_time))
+            else:
+                # First match, set alert_time
+                match_time = ts_to_dt(lookup_es_key(match, rule['timestamp_field']))
+                alert_time = ''
+                if isinstance(rule['aggregation'], dict) and rule['aggregation'].get('schedule'):
+                    croniter._datetime_to_timestamp = cronite_datetime_to_timestamp  # For Python 2.6 compatibility
+                    try:
+                        iter = croniter(rule['aggregation']['schedule'], ts_now())
+                        alert_time = unix_to_dt(iter.get_next())
+                    except Exception as e:
+                        self.handle_error("Error parsing aggregate send time Cron format %s" % (e), rule['aggregation']['schedule'])
+                else:
+                    alert_time = match_time + rule['aggregation']
+
+                rule['aggregate_alert_time'][aggregation_key_value] = alert_time
+                agg_id = None
+                elastalert_logger.info('New aggregation for %s, aggregation_key: %s. next alert at %s.' % (rule['name'], aggregation_key_value, alert_time))
         else:
             # Already pending aggregation, use existing alert_time
-            alert_time = rule['aggregate_alert_time']
-            agg_id = rule['current_aggregate_id']
-            elastalert_logger.info('Adding alert for %s to aggregation(id: %s), next alert at %s' % (rule['name'], agg_id, alert_time))
+            alert_time = rule['aggregate_alert_time'].get(aggregation_key_value)
+            agg_id = rule['current_aggregate_id'].get(aggregation_key_value)
+            elastalert_logger.info('Adding alert for %s to aggregation(id: %s, aggregation_key: %s), next alert at %s' % (rule['name'], agg_id, aggregation_key_value, alert_time))
 
         alert_body = self.get_alert_body(match, rule, False, alert_time)
         if agg_id:
             alert_body['aggregate_id'] = agg_id
+        if aggregation_key_value:
+            alert_body['aggregate_key'] = aggregation_key_value
         res = self.writeback('elastalert', alert_body)
 
         # If new aggregation, save _id
         if res and not agg_id:
-            rule['current_aggregate_id'] = res['_id']
+            rule['current_aggregate_id'][aggregation_key_value] = res['_id']
 
         # Couldn't write the match to ES, save it in memory for now
         if not res:
@@ -1152,7 +1265,7 @@ class ElastAlerter():
 
         return res
 
-    def silence(self):
+    def silence(self, silence_cache_key=None):
         """ Silence an alert for a period of time. --silence and --rule must be passed as args. """
         if self.debug:
             logging.error('--silence not compatible with --debug')
@@ -1163,7 +1276,8 @@ class ElastAlerter():
             exit(1)
 
         # With --rule, self.rules will only contain that specific rule
-        rule_name = self.rules[0]['name']
+        if not silence_cache_key:
+            silence_cache_key = self.rules[0]['name'] + "._silence"
 
         try:
             unit, num = self.args.silence.split('=')
@@ -1174,20 +1288,20 @@ class ElastAlerter():
             logging.error('%s is not a valid time period' % (self.args.silence))
             exit(1)
 
-        if not self.set_realert(rule_name, silence_ts, 0):
-            logging.error('Failed to save silence command to elasticsearch')
+        if not self.set_realert(silence_cache_key, silence_ts, 0):
+            logging.error('Failed to save silence command to Elasticsearch')
             exit(1)
 
-        elastalert_logger.info('Success. %s will be silenced until %s' % (rule_name, silence_ts))
+        elastalert_logger.info('Success. %s will be silenced until %s' % (silence_cache_key, silence_ts))
 
-    def set_realert(self, rule_name, timestamp, exponent):
-        """ Write a silence to elasticsearch for rule_name until timestamp. """
+    def set_realert(self, silence_cache_key, timestamp, exponent):
+        """ Write a silence to Elasticsearch for silence_cache_key until timestamp. """
         body = {'exponent': exponent,
-                'rule_name': rule_name,
+                'rule_name': silence_cache_key,
                 '@timestamp': ts_now(),
                 'until': timestamp}
 
-        self.silence_cache[rule_name] = (timestamp, exponent)
+        self.silence_cache[silence_cache_key] = (timestamp, exponent)
         return self.writeback('silence', body)
 
     def is_silenced(self, rule_name):
@@ -1201,8 +1315,13 @@ class ElastAlerter():
         if self.debug:
             return False
 
-        query = {'filter': {'term': {'rule_name': rule_name}},
-                 'sort': {'until': {'order': 'desc'}}}
+        query = {'term': {'rule_name': rule_name}}
+        sort = {'sort': {'until': {'order': 'desc'}}}
+        if self.is_five():
+            query = {'query': query}
+        else:
+            query = {'filter': query}
+        query.update(sort)
 
         if self.writeback_es:
             try:
@@ -1225,7 +1344,7 @@ class ElastAlerter():
     def handle_error(self, message, data=None):
         ''' Logs message at error level and writes message, data and traceback to Elasticsearch. '''
         if not self.writeback_es:
-            self.writeback_es = self.new_elasticsearch(self.es_conn_config)
+            self.writeback_es = elasticsearch_client(self.conf)
 
         logging.error(message)
         body = {'message': message}

@@ -4,9 +4,11 @@
 [![Join the chat at https://gitter.im/Yelp/elastalert](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/Yelp/elastalert?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ## ElastAlert - [Read the Docs](http://elastalert.readthedocs.org).
-### Easy & Flexible Alerting With ElasticSearch
+### Easy & Flexible Alerting With Elasticsearch
 
 ElastAlert is a simple framework for alerting on anomalies, spikes, or other patterns of interest from data in Elasticsearch.
+
+ElastAlert works with all versions of Elasticsearch.
 
 At Yelp, we use Elasticsearch, Logstash and Kibana for managing our ever increasing amount of data and logs.
 Kibana is great for visualizing and querying data, but we quickly realized that it needed a companion tool for alerting
@@ -47,6 +49,7 @@ Currently, we have support built in for the following alert types:
 - AWS SNS
 - VictorOps
 - PagerDuty
+- Twilio
 - Gitter
 
 Additional rule types and alerts can be easily imported or written.

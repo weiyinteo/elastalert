@@ -1,4 +1,4 @@
-ElastAlert - Easy & Flexible Alerting With ElasticSearch
+ElastAlert - Easy & Flexible Alerting With Elasticsearch
 ********************************************************
 
 ElastAlert is a simple framework for alerting on anomalies, spikes, or other patterns of interest from data in Elasticsearch.
@@ -40,6 +40,7 @@ Currently, we have support built in for these alert types:
 - Slack
 - Telegram
 - Debug
+- Stomp
 
 Additional rule types and alerts can be easily imported or written. (See :ref:`Writing rule types <writingrules>` and :ref:`Writing alerts <writingalerts>`)
 
@@ -108,7 +109,9 @@ even if ElastAlert is stopped and restarted, it will never miss data or look at 
 
 ``es_port``: The port corresponding to ``es_host``.
 
-``use_ssl``: Optional; whether or not to connect to ``es_host`` using SSL; set to ``True`` or ``False``.
+``use_ssl``: Optional; whether or not to connect to ``es_host`` using TLS; set to ``True`` or ``False``.
+
+``verify_certs``: Optional; whether or not to verify TLS certificates; set to ``True`` or ``False``. The default is ``True``.
 
 ``es_username``: Optional; basic-auth username for connecting to ``es_host``.
 
@@ -116,11 +119,15 @@ even if ElastAlert is stopped and restarted, it will never miss data or look at 
 
 ``es_url_prefix``: Optional; URL prefix for the Elasticsearch endpoint.
 
+``es_send_get_body_as``: Optional; Method for querying Elasticsearch - ``GET``, ``POST`` or ``source``. The default is ``GET``
+
 ``es_conn_timeout``: Optional; sets timeout for connecting to and reading from ``es_host``; defaults to ``10``.
 
 ``rules_folder``: The name of the folder which contains rule configuration files. ElastAlert will load all
 files in this folder, and all subdirectories, that end in .yaml. If the contents of this folder change, ElastAlert will load, reload
 or remove rules based on their respective config files.
+
+``scan_subdirectories``: Optional; Sets whether or not ElastAlert should recursively descend the rules directory - ``true`` or ``false``. The default is ``true``
 
 ``run_every``: How often ElastAlert should query Elasticsearch. ElastAlert will remember the last time
 it ran the query for a given rule, and periodically query from that time until the present. The format of
@@ -131,8 +138,9 @@ configuration.
 
 ``max_query_size``: The maximum number of documents that will be downloaded from Elasticsearch in a single query. The
 default is 10,000, and if you expect to get near this number, consider using ``use_count_query`` for the rule. If this
-limit is reached, a warning will be logged but ElastAlert will continue without downloading more results. This setting
-can be overridden by any individual rule.
+limit is reached, ElastAlert will `scroll <https://www.elastic.co/guide/en/elasticsearch/reference/current/search-request-scroll.html>`_ through pages the size of ``max_query_size`` until processing all results.
+
+``scroll_keepalive``: The maximum time (formatted in `Time Units <https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units>`_) the scrolling context should be kept alive. Avoid using high values as it abuses resources in Elasticsearch, but be mindful to allow sufficient time to finish processing all the results.
 
 ``max_aggregation``: The maximum number of alerts to aggregate together. If a rule has ``aggregation`` set, all
 alerts occuring within a timeframe will be sent together. The default is 10,000.
@@ -158,9 +166,12 @@ unless overwritten in the rule config. The default is "localhost".
 
 ``email_reply_to``: This sets the Reply-To header in emails. The default is the recipient address.
 
-``aws_region``: This makes ElastAlert to sign HTTP requests when using Amazon ElasticSearch Service. It'll use instance role keys to sign the requests.
+``aws_region``: This makes ElastAlert to sign HTTP requests when using Amazon Elasticsearch Service. It'll use instance role keys to sign the requests.
 
-``boto_profile``: Boto profile to use when signing requests to Amazon ElasticSearch Service, if you don't want to use the instance role keys.
+``boto_profile``: Boto profile to use when signing requests to Amazon Elasticsearch Service, if you don't want to use the instance role keys.
+
+``replace_dots_in_field_names``: If ``True``, ElastAlert replaces any dots in field names with an underscore before writing documents to Elasticsearch.
+The default value is ``False``. Elasticsearch 2.0 - 2.3 does not support dots in field names.
 
 .. _runningelastalert:
 

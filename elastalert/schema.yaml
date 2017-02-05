@@ -9,7 +9,7 @@ definitions:
   # Either a single string OR an array of strings OR an array of ararys
   arrayOfStringsOrOtherArrays: &arrayOfStringsOrOtherArray
     type: [string, array]
-    items: {type: string, type: array}
+    items: {type: [string, array]}
 
   timeFrame: &timeframe
     type: object
@@ -126,6 +126,7 @@ properties:
   name: {type: string}
 
   use_ssl: {type: boolean}
+  verify_certs: {type: boolean}
   es_username: {type: string}
   es_password: {type: string}
   use_strftime_index: {type: boolean}
@@ -139,9 +140,15 @@ properties:
   query_delay: *timeframe
   max_query_size: {type: integer}
 
+  owner: {type: string}
+  priority: {type: integer}
+
   filter :
-    type: array
+    type: [array, object]
     items: *filter
+    additionalProperties: false
+    properties:
+        download_dashboard: {type: string}
 
   include: {type: array, items: {type: string}}
   top_count_keys: {type: array, items: {type: string}}
@@ -153,6 +160,7 @@ properties:
   use_local_time: {type: boolean}
   match_enhancements: {type: array, items: {type: string}}
   query_key: *arrayOfString
+  replace_dots_in_field_names: {type: boolean}
 
   # Alert Content
   alert_text: {type: string} # Python format string
@@ -165,6 +173,7 @@ properties:
   ### Commands
   command: *arrayOfString
   pipe_match_json: {type: boolean}
+  fail_on_non_zero_exit: {type: boolean}
 
   ### Email
   email: *arrayOfString
@@ -179,26 +188,43 @@ properties:
   jira_issuetype: {type: string}
   jira_account_file: {type: string} # a Yaml file that includes the keys {user:, password:}
 
-  jira_component: {type: string}
-  jira_label: {type: string}
+  jira_assignee: {type: string}
+  jira_component: *arrayOfString
+  jira_components: *arrayOfString
+  jira_label: *arrayOfString
+  jira_labels: *arrayOfString
   jira_bump_tickets: {type: boolean}
+  jira_bump_in_statuses: *arrayOfString
+  jira_bump_not_in_statuses: *arrayOfString
   jira_max_age: {type: number}
+  jira_watchers: *arrayOfString
 
   ### HipChat
   hipchat_auth_token: {type: string}
-  hipchat_room_id: {type: number}
+  hipchat_room_id: {type: string}
   hipchat_domain: {type: string}
   hipchat_ignore_ssl_errors: {type: boolean}
+  hipchat_notify: {type: boolean}
+  hipchat_from: {type: string}
 
   ### Slack
-  slack_webhook_url: {type: string}
+  slack_webhook_url: *arrayOfString
   slack_username_override: {type: string}
   slack_emoji_override: {type: string}
+  slack_icon_url_override: {type: string}
   slack_msg_color: {enum: [good, warning, danger]}
+  slack_parse_override: {enum: [none, full]}
+  slack_text_string: {type: string}
 
   ### PagerDuty
   pagerduty_service_key: {type: string}
   pagerduty_client_name: {type: string}
+
+  ### Twilio
+  twilio_accout_sid: {type: string}
+  twilio_auth_token: {type: string}
+  twilio_to_number: {type: string}
+  twilio_from_number: {type: string}
 
   ### VictorOps
   victorops_api_key: {type: string}

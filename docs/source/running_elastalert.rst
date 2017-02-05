@@ -6,7 +6,7 @@ Running ElastAlert for the First Time
 Requirements
 ------------
 
-- Elasticsearch 1.* or 2.*
+- Elasticsearch
 - ISO8601 or Unix timestamped data
 - Python 2.6 or 2.7
 - pip, see requirements.txt
@@ -23,6 +23,16 @@ Install the module::
     $ python setup.py install
     $ pip install -r requirements.txt
 
+Depending on the version of Elasticsearch, you may need to manually install the correct version of elasticsearch-py.
+
+Elasticsearch 5.0+::
+
+    $ pip install elasticsearch>=5.0.0
+
+Elasticsearch 2.X::
+
+    $ pip install elasticsearch<3.0.0
+
 Next, open up config.yaml.example. In it, you will find several configuration options. ElastAlert may be run without changing any of these settings.
 
 ``rules_folder`` is where ElastAlert will load rule configuration files from. It will attempt to load every .yaml file in the folder. Without any valid rules, ElastAlert will not start. ElastAlert will also load new rules, stop running missing rules, and restart modified rules as the files in this folder change. For this tutorial, we will use the example_rules folder.
@@ -35,13 +45,17 @@ Next, open up config.yaml.example. In it, you will find several configuration op
 
 ``es_port`` is the port corresponding to ``es_host``.
 
-``use_ssl``: Optional; whether or not to connect to ``es_host`` using SSL; set to ``True`` or ``False``.
+``use_ssl``: Optional; whether or not to connect to ``es_host`` using TLS; set to ``True`` or ``False``.
+
+``verify_certs``: Optional; whether or not to verify TLS certificates; set to ``True`` or ``False``. The default is ``True``
 
 ``es_username``: Optional; basic-auth username for connecting to ``es_host``.
 
 ``es_password``: Optional; basic-auth password for connecting to ``es_host``.
 
 ``es_url_prefix``: Optional; URL prefix for the Elasticsearch endpoint.
+
+``es_send_get_body_as``: Optional; Method for querying Elasticsearch - ``GET``, ``POST`` or ``source``. The default is ``GET``
 
 ``writeback_index`` is the name of the index in which ElastAlert will store data. We will create this index later.
 
@@ -117,6 +131,15 @@ Running the ``elastalert-test-rule`` tool will test that your config file succes
 
     $ elastalert-test-rule example_rules/example_frequency.yaml
 
+If you want to specify a configuration file to use, you can run it with the config flag.
+
+    $ elastalert-test-rule --config <path-to-config-file> example_rules/example_frequency.yaml.
+
+The configuration preferences will be loaded as follows:
+    1. Configurations specified in the yaml file.
+    2. Configurations specified in the config file, if specified.
+    3. Default configurations, for the tool to run.
+
 See :ref:`the testing section for more details <testing>`
 
 Running ElastAlert
@@ -125,9 +148,9 @@ Running ElastAlert
 There are two ways of invoking ElastAlert. As a daemon, through Supervisor (http://supervisord.org/), or directly with Python. For easier debugging purposes in this tutorial, we will invoke it directly::
 
     $ python -m elastalert.elastalert --verbose --rule example_frequency.yaml  # or use the entry point: elastalert --verbose --rule ...
-    No handlers could be found for logger "elasticsearch"
+    No handlers could be found for logger "Elasticsearch"
     INFO:root:Queried rule Example rule from 1-15 14:22 PST to 1-15 15:07 PST: 5 hits
-    INFO:elasticsearch:POST http://elasticsearch.example.com:14900/elastalert_status/elastalert_status?op_type=create [status:201 request:0.025s]
+    INFO:Elasticsearch:POST http://elasticsearch.example.com:14900/elastalert_status/elastalert_status?op_type=create [status:201 request:0.025s]
     INFO:root:Ran Example rule from 1-15 14:22 PST to 1-15 15:07 PST: 5 query hits, 0 matches, 0 alerts sent
     INFO:root:Sleeping for 297 seconds
 

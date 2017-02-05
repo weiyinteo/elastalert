@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import copy
 import datetime
 
 import mock
@@ -158,7 +159,7 @@ def test_freq_terms():
 
 def test_eventwindow():
     timeframe = datetime.timedelta(minutes=10)
-    window = EventWindow(timeframe, getTimestamp=lambda e: e[0]['@timestamp'])
+    window = EventWindow(timeframe)
     timestamps = [ts_to_dt(x) for x in ['2014-01-01T10:00:00',
                                         '2014-01-01T10:05:00',
                                         '2014-01-01T10:03:00',
@@ -471,12 +472,35 @@ def test_new_term():
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
 
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        call_args = []
+
+        # search is called with a mutable dict containing timestamps, this is required to test
+        def record_args(*args, **kwargs):
+            call_args.append((copy.deepcopy(args), copy.deepcopy(kwargs)))
+            return mock_res
+
+        mock_es.return_value.search.side_effect = record_args
         rule = NewTermsRule(rules)
 
-        assert rule.es.search.call_count == 2
+    # 30 day default range, 1 day default step, times 2 fields
+    assert rule.es.search.call_count == 60
+
+    # Assert that all calls have the proper ordering of time ranges
+    old_ts = '2010-01-01T00:00:00Z'
+    old_field = ''
+    for call in call_args:
+        field = call[1]['body']['aggs']['filtered']['aggs']['values']['terms']['field']
+        if old_field != field:
+            old_field = field
+            old_ts = '2010-01-01T00:00:00Z'
+        gte = call[1]['body']['aggs']['filtered']['filter']['bool']['must'][0]['range']['@timestamp']['gte']
+        assert gte > old_ts
+        lt = call[1]['body']['aggs']['filtered']['filter']['bool']['must'][0]['range']['@timestamp']['lt']
+        assert lt > gte
+        old_ts = gte
 
     # Key1 and key2 shouldn't cause a match
     rule.add_data([{'@timestamp': ts_now(), 'a': 'key1', 'b': 'key2'}])
@@ -499,7 +523,7 @@ def test_new_term():
 
     # Missing_field
     rules['alert_on_missing_field'] = True
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
         rule = NewTermsRule(rules)
@@ -515,12 +539,12 @@ def test_new_term_nested_field():
              'es_host': 'example.com', 'es_port': 10, 'index': 'logstash'}
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
         rule = NewTermsRule(rules)
 
-        assert rule.es.search.call_count == 2
+        assert rule.es.search.call_count == 60
 
     # Key3 causes an alert for nested field b.c
     rule.add_data([{'@timestamp': ts_now(), 'b': {'c': 'key3'}}])
@@ -533,16 +557,18 @@ def test_new_term_nested_field():
 def test_new_term_with_terms():
     rules = {'fields': ['a'],
              'timestamp_field': '@timestamp',
-             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash', 'query_key': 'a'}
+             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash', 'query_key': 'a',
+             'window_step_size': {'days': 2}}
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
 
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
         rule = NewTermsRule(rules)
 
-        assert rule.es.search.call_count == 1
+        # Only 15 queries because of custom step size
+        assert rule.es.search.call_count == 15
 
     # Key1 and key2 shouldn't cause a match
     terms = {ts_now(): [{'key': 'key1', 'doc_count': 1},
@@ -604,12 +630,12 @@ def test_new_term_with_composite_fields():
         }
     }
 
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
         rule = NewTermsRule(rules)
 
-        assert rule.es.search.call_count == 2
+        assert rule.es.search.call_count == 60
 
     # key3 already exists, and thus shouldn't cause a match
     rule.add_data([{'@timestamp': ts_now(), 'a': 'key1', 'b': 'key2', 'c': 'key3'}])
@@ -640,7 +666,7 @@ def test_new_term_with_composite_fields():
 
     # Missing_fields
     rules['alert_on_missing_field'] = True
-    with mock.patch('elastalert.ruletypes.Elasticsearch') as mock_es:
+    with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
         rule = NewTermsRule(rules)
@@ -652,10 +678,12 @@ def test_new_term_with_composite_fields():
 
 
 def test_flatline():
-    events = hits(10)
-    rules = {'timeframe': datetime.timedelta(seconds=30),
-             'threshold': 2,
-             'timestamp_field': '@timestamp'}
+    events = hits(40)
+    rules = {
+        'timeframe': datetime.timedelta(seconds=30),
+        'threshold': 2,
+        'timestamp_field': '@timestamp',
+    }
 
     rule = FlatlineRule(rules)
 
@@ -663,7 +691,8 @@ def test_flatline():
     rule.add_data(hits(1))
     assert rule.matches == []
 
-    rule.add_data(events)
+    # Add hits with timestamps 2014-09-26T12:00:00 --> 2014-09-26T12:00:09
+    rule.add_data(events[0:10])
 
     # This will be run at the end of the hits
     rule.garbage_collect(ts_to_dt('2014-09-26T12:00:11Z'))
@@ -671,6 +700,39 @@ def test_flatline():
 
     # This would be run if the query returned nothing for a future timestamp
     rule.garbage_collect(ts_to_dt('2014-09-26T12:00:45Z'))
+    assert len(rule.matches) == 1
+
+    # After another garbage collection, since there are still no events, a new match is added
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:00:50Z'))
+    assert len(rule.matches) == 2
+
+    # Add hits with timestamps 2014-09-26T12:00:30 --> 2014-09-26T12:00:39
+    rule.add_data(events[30:])
+
+    # Now that there is data in the last 30 minutes, no more matches should be added
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:00:55Z'))
+    assert len(rule.matches) == 2
+
+    # After that window passes with no more data, a new match is added
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:01:11Z'))
+    assert len(rule.matches) == 3
+
+
+def test_flatline_no_data():
+    rules = {
+        'timeframe': datetime.timedelta(seconds=30),
+        'threshold': 2,
+        'timestamp_field': '@timestamp',
+    }
+
+    rule = FlatlineRule(rules)
+
+    # Initial lack of data
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:00:00Z'))
+    assert len(rule.matches) == 0
+
+    # Passed the timeframe, still no events
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:35:00Z'))
     assert len(rule.matches) == 1
 
 
@@ -717,11 +779,11 @@ def test_flatline_query_key():
     assert len(rule.matches) == 2
     assert set(['key1', 'key2']) == set([m['key'] for m in rule.matches if m['@timestamp'] == timestamp])
 
-    # Next time the rule runs, the key1 and key2 will have been forgotten. Now key3 will cause an alert
+    # Next time the rule runs, all 3 keys still have no data, so all three will cause an alert
     timestamp = '2014-09-26T12:01:20Z'
     rule.garbage_collect(ts_to_dt(timestamp))
-    assert len(rule.matches) == 3
-    assert set(['key3']) == set([m['key'] for m in rule.matches if m['@timestamp'] == timestamp])
+    assert len(rule.matches) == 5
+    assert set(['key1', 'key2', 'key3']) == set([m['key'] for m in rule.matches if m['@timestamp'] == timestamp])
 
 
 def test_cardinality_max():
@@ -818,3 +880,45 @@ def test_cardinality_qk():
     assert rule.matches[1]['user'] == 'baz'
     assert rule.matches[0]['foo'] == 'fuz'
     assert rule.matches[1]['foo'] == 'fiz'
+
+
+def test_cardinality_nested_cardinality_field():
+    rules = {'max_cardinality': 4,
+             'timeframe': datetime.timedelta(minutes=10),
+             'cardinality_field': 'd.ip',
+             'timestamp_field': '@timestamp'}
+    rule = CardinalityRule(rules)
+
+    # Add 4 different IPs
+    ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']
+    for ip in ips:
+        event = {'@timestamp': datetime.datetime.now(), 'd': {'ip': ip}}
+        rule.add_data([event])
+        assert len(rule.matches) == 0
+    rule.garbage_collect(datetime.datetime.now())
+
+    # Add a duplicate, stay at 4 cardinality
+    event = {'@timestamp': datetime.datetime.now(), 'd': {'ip': '10.0.0.4'}}
+    rule.add_data([event])
+    rule.garbage_collect(datetime.datetime.now())
+    assert len(rule.matches) == 0
+
+    # Add an event with no IP, stay at 4 cardinality
+    event = {'@timestamp': datetime.datetime.now()}
+    rule.add_data([event])
+    rule.garbage_collect(datetime.datetime.now())
+    assert len(rule.matches) == 0
+
+    # Next unique will trigger
+    event = {'@timestamp': datetime.datetime.now(), 'd': {'ip': '10.0.0.5'}}
+    rule.add_data([event])
+    rule.garbage_collect(datetime.datetime.now())
+    assert len(rule.matches) == 1
+    rule.matches = []
+
+    # 15 minutes later, adding more will not trigger an alert
+    ips = ['10.0.0.6', '10.0.0.7', '10.0.0.8']
+    for ip in ips:
+        event = {'@timestamp': datetime.datetime.now() + datetime.timedelta(minutes=15), 'd': {'ip': ip}}
+        rule.add_data([event])
+        assert len(rule.matches) == 0
