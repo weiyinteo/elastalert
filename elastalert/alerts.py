@@ -2,12 +2,11 @@
 import copy
 import datetime
 import json
+import time
 import logging
 import subprocess
 import sys
 import warnings
-import stomp
-
 from email.mime.text import MIMEText
 from email.utils import formatdate
 from smtplib import SMTP
@@ -15,20 +14,25 @@ from smtplib import SMTP_SSL
 from smtplib import SMTPAuthenticationError
 from smtplib import SMTPException
 from socket import error
+from HTMLParser import HTMLParser
 
-import boto.sns as sns
+import boto3
 import requests
+import stomp
+from exotel import Exotel
 from jira.client import JIRA
 from jira.exceptions import JIRAError
 from requests.exceptions import RequestException
 from staticconf.loader import yaml_loader
 from texttable import Texttable
-from twilio import TwilioRestException
-from twilio.rest import TwilioRestClient
+from twilio.base.exceptions import TwilioRestException
+from twilio.rest import Client as TwilioClient
 from util import EAException
 from util import elastalert_logger
 from util import lookup_es_key
 from util import pretty_ts
+from util import ts_now
+from util import ts_to_dt
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -51,7 +55,7 @@ class BasicMatchString(object):
             self.text += '\n'
 
     def _add_custom_alert_text(self):
-        missing = '<MISSING VALUE>'
+        missing = self.rule.get('alert_missing_value', '<MISSING VALUE>')
         alert_text = unicode(self.rule.get('alert_text', ''))
         if 'alert_text_args' in self.rule:
             alert_text_args = self.rule.get('alert_text_args')
@@ -109,6 +113,7 @@ class BasicMatchString(object):
             if key.startswith('top_events_'):
                 continue
             value_str = unicode(value)
+            value_str.replace('\\n', '\n')
             if type(value) in [list, dict]:
                 try:
                     value_str = self._pretty_print_as_json(value)
@@ -145,7 +150,7 @@ class JiraFormattedMatchString(BasicMatchString):
     def _add_match_items(self):
         match_items = dict([(x, y) for x, y in self.match.items() if not x.startswith('top_events_')])
         json_blob = self._pretty_print_as_json(match_items)
-        preformatted_text = u'{{code:json}}{0}{{code}}'.format(json_blob)
+        preformatted_text = u'{{code}}{0}{{code}}'.format(json_blob)
         self.text += preformatted_text
 
 
@@ -228,19 +233,25 @@ class Alerter(object):
                     if alert_value:
                         alert_subject_values[i] = alert_value
 
-            alert_subject_values = ['<MISSING VALUE>' if val is None else val for val in alert_subject_values]
+            missing = self.rule.get('alert_missing_value', '<MISSING VALUE>')
+            alert_subject_values = [missing if val is None else val for val in alert_subject_values]
             return alert_subject.format(*alert_subject_values)
 
         return alert_subject
 
     def create_alert_body(self, matches):
         body = self.get_aggregation_summary_text(matches)
-        for match in matches:
-            body += unicode(BasicMatchString(self.rule, match))
-            # Separate text of aggregated alerts with dashes
-            if len(matches) > 1:
-                body += '\n----------------------------------------\n'
+        if self.rule.get('alert_text_type') != 'aggregation_summary_only':
+            for match in matches:
+                body += unicode(BasicMatchString(self.rule, match))
+                # Separate text of aggregated alerts with dashes
+                if len(matches) > 1:
+                    body += '\n----------------------------------------\n'
         return body
+
+    def get_aggregation_summary_text__maximum_width(self):
+        """Get maximum width allowed for summary text."""
+        return 80
 
     def get_aggregation_summary_text(self, matches):
         text = ''
@@ -250,9 +261,13 @@ class Alerter(object):
                 summary_table_fields = [summary_table_fields]
             # Include a count aggregation so that we can see at a glance how many of each aggregation_key were encountered
             summary_table_fields_with_count = summary_table_fields + ['count']
-            text += "Aggregation resulted in the following data for summary_table_fields ==> {0}:\n\n".format(summary_table_fields_with_count)
-            text_table = Texttable()
+            text += "Aggregation resulted in the following data for summary_table_fields ==> {0}:\n\n".format(
+                summary_table_fields_with_count
+            )
+            text_table = Texttable(max_width=self.get_aggregation_summary_text__maximum_width())
             text_table.header(summary_table_fields_with_count)
+            # Format all fields as 'text' to avoid long numbers being shown as scientific notation
+            text_table.set_cols_dtype(['t' for i in summary_table_fields_with_count])
             match_aggregation = {}
 
             # Maintain an aggregate count for each unique key encountered in the aggregation period
@@ -285,44 +300,64 @@ class Alerter(object):
 
 class StompAlerter(Alerter):
     """ The stomp alerter publishes alerts via stomp to a broker. """
-    required_options = frozenset(['stomp_hostname', 'stomp_hostport', 'stomp_login', 'stomp_password'])
+    required_options = frozenset(
+        ['stomp_hostname', 'stomp_hostport', 'stomp_login', 'stomp_password'])
 
     def alert(self, matches):
-
         alerts = []
 
         qk = self.rule.get('query_key', None)
+
         fullmessage = {}
         for match in matches:
-            if qk in match:
-                elastalert_logger.info(
-                    'Alert for %s, %s at %s:' % (self.rule['name'], match[qk], lookup_es_key(match, self.rule['timestamp_field'])))
-                alerts.append('1)Alert for %s, %s at %s:' % (self.rule['name'], match[qk], lookup_es_key(match, self.rule['timestamp_field'])))
-                fullmessage['match'] = match[qk]
+            if qk is not None:
+                resmatch = lookup_es_key(match, qk)
             else:
-                elastalert_logger.info('Alert for %s at %s:' % (self.rule['name'], lookup_es_key(match, self.rule['timestamp_field'])))
+                resmatch = None
+
+            if resmatch is not None:
+                elastalert_logger.info(
+                    'Alert for %s, %s at %s:' % (self.rule['name'], resmatch, lookup_es_key(match, self.rule['timestamp_field'])))
                 alerts.append(
-                    '2)Alert for %s at %s:' % (self.rule['name'], lookup_es_key(match, self.rule['timestamp_field']))
+                    'Alert for %s, %s at %s:' % (self.rule['name'], resmatch, lookup_es_key(
+                        match, self.rule['timestamp_field']))
                 )
-                fullmessage['match'] = lookup_es_key(match, self.rule['timestamp_field'])
+                fullmessage['match'] = resmatch
+            else:
+                elastalert_logger.info('Rule %s generated an alert at %s:' % (
+                    self.rule['name'], lookup_es_key(match, self.rule['timestamp_field'])))
+                alerts.append(
+                    'Rule %s generated an alert at %s:' % (self.rule['name'], lookup_es_key(
+                        match, self.rule['timestamp_field']))
+                )
+                fullmessage['match'] = lookup_es_key(
+                    match, self.rule['timestamp_field'])
             elastalert_logger.info(unicode(BasicMatchString(self.rule, match)))
 
         fullmessage['alerts'] = alerts
         fullmessage['rule'] = self.rule['name']
+        fullmessage['rule_file'] = self.rule['rule_file']
+
         fullmessage['matching'] = unicode(BasicMatchString(self.rule, match))
-        fullmessage['alertDate'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fullmessage['alertDate'] = datetime.datetime.now(
+        ).strftime("%Y-%m-%d %H:%M:%S")
         fullmessage['body'] = self.create_alert_body(matches)
+
+        fullmessage['matches'] = matches
 
         self.stomp_hostname = self.rule.get('stomp_hostname', 'localhost')
         self.stomp_hostport = self.rule.get('stomp_hostport', '61613')
         self.stomp_login = self.rule.get('stomp_login', 'admin')
         self.stomp_password = self.rule.get('stomp_password', 'admin')
-        self.stomp_destination = self.rule.get('stomp_destination', '/queue/ALERT')
+        self.stomp_destination = self.rule.get(
+            'stomp_destination', '/queue/ALERT')
 
         conn = stomp.Connection([(self.stomp_hostname, self.stomp_hostport)])
 
         conn.start()
         conn.connect(self.stomp_login, self.stomp_password)
+        # Ensures that the CONNECTED frame is received otherwise, the disconnect call will fail.
+        time.sleep(1)
         conn.send(self.stomp_destination, json.dumps(fullmessage))
         conn.disconnect()
 
@@ -360,6 +395,8 @@ class EmailAlerter(Alerter):
         self.smtp_port = self.rule.get('smtp_port')
         if self.rule.get('smtp_auth_file'):
             self.get_account(self.rule['smtp_auth_file'])
+        self.smtp_key_file = self.rule.get('smtp_key_file')
+        self.smtp_cert_file = self.rule.get('smtp_cert_file')
         # Convert email to a list if it isn't already
         if isinstance(self.rule['email'], basestring):
             self.rule['email'] = [self.rule['email']]
@@ -371,6 +408,9 @@ class EmailAlerter(Alerter):
         bcc = self.rule.get('bcc')
         if bcc and isinstance(bcc, basestring):
             self.rule['bcc'] = [self.rule['bcc']]
+        add_suffix = self.rule.get('email_add_domain')
+        if add_suffix and not add_suffix.startswith('@'):
+            self.rule['email_add_domain'] = '@' + add_suffix
 
     def alert(self, matches):
         body = self.create_alert_body(matches)
@@ -381,9 +421,20 @@ class EmailAlerter(Alerter):
             body += '\nJIRA ticket: %s' % (url)
 
         to_addr = self.rule['email']
+        if 'email_from_field' in self.rule:
+            recipient = lookup_es_key(matches[0], self.rule['email_from_field'])
+            if isinstance(recipient, basestring):
+                if '@' in recipient:
+                    to_addr = [recipient]
+                elif 'email_add_domain' in self.rule:
+                    to_addr = [recipient + self.rule['email_add_domain']]
+            elif isinstance(recipient, list):
+                to_addr = recipient
+                if 'email_add_domain' in self.rule:
+                    to_addr = [name + self.rule['email_add_domain'] for name in to_addr]
         email_msg = MIMEText(body.encode('UTF-8'), _charset='UTF-8')
         email_msg['Subject'] = self.create_title(matches)
-        email_msg['To'] = ', '.join(self.rule['email'])
+        email_msg['To'] = ', '.join(to_addr)
         email_msg['From'] = self.from_addr
         email_msg['Reply-To'] = self.rule.get('email_reply_to', email_msg['To'])
         email_msg['Date'] = formatdate()
@@ -396,9 +447,9 @@ class EmailAlerter(Alerter):
         try:
             if self.smtp_ssl:
                 if self.smtp_port:
-                    self.smtp = SMTP_SSL(self.smtp_host, self.smtp_port)
+                    self.smtp = SMTP_SSL(self.smtp_host, self.smtp_port, keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
                 else:
-                    self.smtp = SMTP_SSL(self.smtp_host)
+                    self.smtp = SMTP_SSL(self.smtp_host, keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
             else:
                 if self.smtp_port:
                     self.smtp = SMTP(self.smtp_host, self.smtp_port)
@@ -406,7 +457,7 @@ class EmailAlerter(Alerter):
                     self.smtp = SMTP(self.smtp_host)
                 self.smtp.ehlo()
                 if self.smtp.has_extn('STARTTLS'):
-                    self.smtp.starttls()
+                    self.smtp.starttls(keyfile=self.smtp_key_file, certfile=self.smtp_cert_file)
             if 'smtp_auth_file' in self.rule:
                 self.smtp.login(self.user, self.password)
         except (SMTPException, error) as e:
@@ -416,7 +467,7 @@ class EmailAlerter(Alerter):
         self.smtp.sendmail(self.from_addr, to_addr, email_msg.as_string())
         self.smtp.close()
 
-        elastalert_logger.info("Sent email to %s" % (self.rule['email']))
+        elastalert_logger.info("Sent email to %s" % (to_addr))
 
     def create_default_title(self, matches):
         subject = 'ElastAlert: %s' % (self.rule['name'])
@@ -443,6 +494,7 @@ class JiraAlerter(Alerter):
     known_field_list = [
         'jira_account_file',
         'jira_assignee',
+        'jira_bump_after_inactivity',
         'jira_bump_in_statuses',
         'jira_bump_not_in_statuses',
         'jira_bump_tickets',
@@ -479,6 +531,10 @@ class JiraAlerter(Alerter):
         self.project = self.rule['jira_project']
         self.issue_type = self.rule['jira_issuetype']
 
+        # Deferred settings refer to values that can only be resolved when a match
+        # is found and as such loading them will be delayed until we find a match
+        self.deferred_settings = []
+
         # We used to support only a single component. This allows us to maintain backwards compatibility
         # while also giving the user-facing API a more representative name
         self.components = self.rule.get('jira_components', self.rule.get('jira_component'))
@@ -494,7 +550,9 @@ class JiraAlerter(Alerter):
         self.bump_tickets = self.rule.get('jira_bump_tickets', False)
         self.bump_not_in_statuses = self.rule.get('jira_bump_not_in_statuses')
         self.bump_in_statuses = self.rule.get('jira_bump_in_statuses')
+        self.bump_after_inactivity = self.rule.get('jira_bump_after_inactivity', 0)
         self.watchers = self.rule.get('jira_watchers')
+        self.client = None
 
         if self.bump_in_statuses and self.bump_not_in_statuses:
             msg = 'Both jira_bump_in_statuses (%s) and jira_bump_not_in_statuses (%s) are set.' % \
@@ -506,6 +564,26 @@ class JiraAlerter(Alerter):
             msg += ' This should be simplified to use only one or the other.'
             logging.warning(msg)
 
+        self.reset_jira_args()
+
+        try:
+            self.client = JIRA(self.server, basic_auth=(self.user, self.password))
+            self.get_priorities()
+            self.get_arbitrary_fields()
+        except JIRAError as e:
+            # JIRAError may contain HTML, pass along only first 1024 chars
+            raise EAException("Error connecting to JIRA: %s" % (str(e)[:1024])), None, sys.exc_info()[2]
+
+        self.set_priority()
+
+    def set_priority(self):
+        try:
+            if self.priority is not None and self.client is not None:
+                self.jira_args['priority'] = {'id': self.priority_ids[self.priority]}
+        except KeyError:
+            logging.error("Priority %s not found. Valid priorities are %s" % (self.priority, self.priority_ids.keys()))
+
+    def reset_jira_args(self):
         self.jira_args = {'project': {'key': self.project},
                           'issuetype': {'name': self.issue_type}}
 
@@ -527,90 +605,86 @@ class JiraAlerter(Alerter):
         if self.assignee:
             self.jira_args['assignee'] = {'name': self.assignee}
 
-        try:
-            self.client = JIRA(self.server, basic_auth=(self.user, self.password))
-            self.get_priorities()
-            self.get_arbitrary_fields()
-        except JIRAError as e:
-            # JIRAError may contain HTML, pass along only first 1024 chars
-            raise EAException("Error connecting to JIRA: %s" % (str(e)[:1024]))
+        self.set_priority()
 
-        try:
-            if self.priority is not None:
-                self.jira_args['priority'] = {'id': self.priority_ids[self.priority]}
-        except KeyError:
-            logging.error("Priority %s not found. Valid priorities are %s" % (self.priority, self.priority_ids.keys()))
+    def set_jira_arg(self, jira_field, value, fields):
+        # Remove the jira_ part.  Convert underscores to spaces
+        normalized_jira_field = jira_field[5:].replace('_', ' ').lower()
+        # All jira fields should be found in the 'id' or the 'name' field. Therefore, try both just in case
+        for identifier in ['name', 'id']:
+            field = next((f for f in fields if normalized_jira_field == f[identifier].replace('_', ' ').lower()), None)
+            if field:
+                break
+        if not field:
+            # Log a warning to ElastAlert saying that we couldn't find that type?
+            # OR raise and fail to load the alert entirely? Probably the latter...
+            raise Exception("Could not find a definition for the jira field '{0}'".format(normalized_jira_field))
+        arg_name = field['id']
+        # Check the schema information to decide how to set the value correctly
+        # If the schema information is not available, raise an exception since we don't know how to set it
+        # Note this is only the case for two built-in types, id: issuekey and id: thumbnail
+        if not ('schema' in field or 'type' in field['schema']):
+            raise Exception("Could not determine schema information for the jira field '{0}'".format(normalized_jira_field))
+        arg_type = field['schema']['type']
+
+        # Handle arrays of simple types like strings or numbers
+        if arg_type == 'array':
+            # As a convenience, support the scenario wherein the user only provides
+            # a single value for a multi-value field e.g. jira_labels: Only_One_Label
+            if type(value) != list:
+                value = [value]
+            array_items = field['schema']['items']
+            # Simple string types
+            if array_items in ['string', 'date', 'datetime']:
+                # Special case for multi-select custom types (the JIRA metadata says that these are strings, but
+                # in reality, they are required to be provided as an object.
+                if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
+                    self.jira_args[arg_name] = [{'value': v} for v in value]
+                else:
+                    self.jira_args[arg_name] = value
+            elif array_items == 'number':
+                self.jira_args[arg_name] = [int(v) for v in value]
+            # Also attempt to handle arrays of complex types that have to be passed as objects with an identifier 'key'
+            elif array_items == 'option':
+                self.jira_args[arg_name] = [{'value': v} for v in value]
+            else:
+                # Try setting it as an object, using 'name' as the key
+                # This may not work, as the key might actually be 'key', 'id', 'value', or something else
+                # If it works, great!  If not, it will manifest itself as an API error that will bubble up
+                self.jira_args[arg_name] = [{'name': v} for v in value]
+        # Handle non-array types
+        else:
+            # Simple string types
+            if arg_type in ['string', 'date', 'datetime']:
+                # Special case for custom types (the JIRA metadata says that these are strings, but
+                # in reality, they are required to be provided as an object.
+                if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
+                    self.jira_args[arg_name] = {'value': value}
+                else:
+                    self.jira_args[arg_name] = value
+            # Number type
+            elif arg_type == 'number':
+                self.jira_args[arg_name] = int(value)
+            elif arg_type == 'option':
+                self.jira_args[arg_name] = {'value': value}
+            # Complex type
+            else:
+                self.jira_args[arg_name] = {'name': value}
 
     def get_arbitrary_fields(self):
+        # Clear jira_args
+        self.reset_jira_args()
+
         # This API returns metadata about all the fields defined on the jira server (built-ins and custom ones)
         fields = self.client.fields()
         for jira_field, value in self.rule.iteritems():
             # If we find a field that is not covered by the set that we are aware of, it means it is either:
             # 1. A built-in supported field in JIRA that we don't have on our radar
             # 2. A custom field that a JIRA admin has configured
-            if jira_field.startswith('jira_') and jira_field not in self.known_field_list:
-                # Remove the jira_ part.  Convert underscores to spaces
-                normalized_jira_field = jira_field[5:].replace('_', ' ').lower()
-                # All jira fields should be found in the 'id' or the 'name' field. Therefore, try both just in case
-                for identifier in ['name', 'id']:
-                    field = next((f for f in fields if normalized_jira_field == f[identifier].replace('_', ' ').lower()), None)
-                    if field:
-                        break
-                if not field:
-                    # Log a warning to ElastAlert saying that we couldn't find that type?
-                    # OR raise and fail to load the alert entirely? Probably the latter...
-                    raise Exception("Could not find a definition for the jira field '{0}'".format(normalized_jira_field))
-                arg_name = field['id']
-                # Check the schema information to decide how to set the value correctly
-                # If the schema information is not available, raise an exception since we don't know how to set it
-                # Note this is only the case for two built-in types, id: issuekey and id: thumbnail
-                if not ('schema' in field or 'type' in field['schema']):
-                    raise Exception("Could not determine schema information for the jira field '{0}'".format(normalized_jira_field))
-                arg_type = field['schema']['type']
-
-                # Handle arrays of simple types like strings or numbers
-                if arg_type == 'array':
-                    # As a convenience, support the scenario wherein the user only provides
-                    # a single value for a multi-value field e.g. jira_labels: Only_One_Label
-                    if type(value) != list:
-                        value = [value]
-                    array_items = field['schema']['items']
-                    # Simple string types
-                    if array_items in ['string', 'date', 'datetime']:
-                        # Special case for multi-select custom types (the JIRA metadata says that these are strings, but
-                        # in reality, they are required to be provided as an object.
-                        if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
-                            self.jira_args[arg_name] = [{'value': v} for v in value]
-                        else:
-                            self.jira_args[arg_name] = value
-                    elif array_items == 'number':
-                        self.jira_args[arg_name] = [int(v) for v in value]
-                    # Also attempt to handle arrays of complex types that have to be passed as objects with an identifier 'key'
-                    elif array_items == 'option':
-                        self.jira_args[arg_name] = [{'value': v} for v in value]
-                    else:
-                        # Try setting it as an object, using 'name' as the key
-                        # This may not work, as the key might actually be 'key', 'id', 'value', or something else
-                        # If it works, great!  If not, it will manifest itself as an API error that will bubble up
-                        self.jira_args[arg_name] = [{'name': v} for v in value]
-                # Handle non-array types
-                else:
-                    # Simple string types
-                    if arg_type in ['string', 'date', 'datetime']:
-                        # Special case for custom types (the JIRA metadata says that these are strings, but
-                        # in reality, they are required to be provided as an object.
-                        if 'custom' in field['schema'] and field['schema']['custom'] in self.custom_string_types_with_special_handling:
-                            self.jira_args[arg_name] = {'value': value}
-                        else:
-                            self.jira_args[arg_name] = value
-                    # Number type
-                    elif arg_type == 'number':
-                        self.jira_args[arg_name] = int(value)
-                    elif arg_type == 'option':
-                        self.jira_args[arg_name] = {'value': value}
-                    # Complex type
-                    else:
-                        self.jira_args[arg_name] = {'name': value}
+            if jira_field.startswith('jira_') and jira_field not in self.known_field_list and str(value)[:1] != '#':
+                self.set_jira_arg(jira_field, value, fields)
+            if jira_field.startswith('jira_') and jira_field not in self.known_field_list and str(value)[:1] == '#':
+                self.deferred_settings.append(jira_field)
 
     def get_priorities(self):
         """ Creates a mapping of priority index to id. """
@@ -644,9 +718,11 @@ class JiraAlerter(Alerter):
         date = (datetime.datetime.now() - datetime.timedelta(days=self.max_age)).strftime('%Y-%m-%d')
         jql = 'project=%s AND summary~"%s" and created >= "%s"' % (self.project, title, date)
         if self.bump_in_statuses:
-            jql = '%s and status in (%s)' % (jql, ','.join(self.bump_in_statuses))
+            jql = '%s and status in (%s)' % (jql, ','.join(["\"%s\"" % status if ' ' in status else status for status
+                                                            in self.bump_in_statuses]))
         if self.bump_not_in_statuses:
-            jql = '%s and status not in (%s)' % (jql, ','.join(self.bump_not_in_statuses))
+            jql = '%s and status not in (%s)' % (jql, ','.join(["\"%s\"" % status if ' ' in status else status
+                                                                for status in self.bump_not_in_statuses]))
         try:
             issues = self.client.search_issues(jql)
         except JIRAError as e:
@@ -663,11 +739,23 @@ class JiraAlerter(Alerter):
         self.client.add_comment(ticket, comment)
 
     def alert(self, matches):
+        if len(self.deferred_settings) > 0:
+            fields = self.client.fields()
+            for jira_field in self.deferred_settings:
+                value = lookup_es_key(matches[0], self.rule[jira_field][1:])
+                self.set_jira_arg(jira_field, value, fields)
+
         title = self.create_title(matches)
 
         if self.bump_tickets:
             ticket = self.find_existing_ticket(matches)
             if ticket:
+                inactivity_datetime = ts_now() - datetime.timedelta(days=self.bump_after_inactivity)
+                if ts_to_dt(ticket.fields.updated) >= inactivity_datetime:
+                    if self.pipeline is not None:
+                        self.pipeline['jira_ticket'] = None
+                        self.pipeline['jira_server'] = self.server
+                    return None
                 elastalert_logger.info('Commenting on existing ticket %s' % (ticket.key))
                 for match in matches:
                     try:
@@ -693,10 +781,14 @@ class JiraAlerter(Alerter):
                     except Exception as ex:
                         # Re-raise the exception, preserve the stack-trace, and give some
                         # context as to which watcher failed to be added
-                        raise Exception("Exception encountered when trying to add '{0}' as a watcher. Does the user exist?\n{1}" .format(watcher, ex)), None, sys.exc_info()[2]
+                        raise Exception(
+                            "Exception encountered when trying to add '{0}' as a watcher. Does the user exist?\n{1}" .format(
+                                watcher,
+                                ex
+                            )), None, sys.exc_info()[2]
 
         except JIRAError as e:
-            raise EAException("Error creating JIRA ticket: %s" % (e))
+            raise EAException("Error creating JIRA ticket using jira_args (%s): %s" % (self.jira_args, e))
         elastalert_logger.info("Opened Jira ticket: %s" % (self.issue))
 
         if self.pipeline is not None:
@@ -706,10 +798,11 @@ class JiraAlerter(Alerter):
     def create_alert_body(self, matches):
         body = self.description + '\n'
         body += self.get_aggregation_summary_text(matches)
-        for match in matches:
-            body += unicode(JiraFormattedMatchString(self.rule, match))
-            if len(matches) > 1:
-                body += '\n----------------------------------------\n'
+        if self.rule.get('alert_text_type') != 'aggregation_summary_only':
+            for match in matches:
+                body += unicode(JiraFormattedMatchString(self.rule, match))
+                if len(matches) > 1:
+                    body += '\n----------------------------------------\n'
         return body
 
     def get_aggregation_summary_text(self, matches):
@@ -720,8 +813,9 @@ class JiraAlerter(Alerter):
 
     def create_default_title(self, matches, for_search=False):
         # If there is a query_key, use that in the title
-        if 'query_key' in self.rule and self.rule['query_key'] in matches[0]:
-            title = 'ElastAlert: %s matched %s' % (matches[0][self.rule['query_key']], self.rule['name'])
+
+        if 'query_key' in self.rule and lookup_es_key(matches[0], self.rule['query_key']):
+            title = 'ElastAlert: %s matched %s' % (lookup_es_key(matches[0], self.rule['query_key']), self.rule['name'])
         else:
             title = 'ElastAlert: %s' % (self.rule['name'])
 
@@ -789,16 +883,17 @@ class CommandAlerter(Alerter):
 
 
 class SnsAlerter(Alerter):
-    """send alert using AWS SNS service"""
+    """ Send alert using AWS SNS service """
     required_options = frozenset(['sns_topic_arn'])
 
     def __init__(self, *args):
         super(SnsAlerter, self).__init__(*args)
         self.sns_topic_arn = self.rule.get('sns_topic_arn', '')
-        self.aws_access_key = self.rule.get('aws_access_key', '')
-        self.aws_secret_key = self.rule.get('aws_secret_key', '')
+        self.aws_access_key_id = self.rule.get('aws_access_key_id')
+        self.aws_secret_access_key = self.rule.get('aws_secret_access_key')
         self.aws_region = self.rule.get('aws_region', 'us-east-1')
-        self.boto_profile = self.rule.get('boto_profile', '')
+        self.profile = self.rule.get('boto_profile', None)  # Deprecated
+        self.profile = self.rule.get('aws_profile', None)
 
     def create_default_title(self, matches):
         subject = 'ElastAlert: %s' % (self.rule['name'])
@@ -807,19 +902,18 @@ class SnsAlerter(Alerter):
     def alert(self, matches):
         body = self.create_alert_body(matches)
 
-        # use aws_access_key and aws_secret_key if specified; then use boto profile if specified;
-        # otherwise use instance role
-        if not self.aws_access_key and not self.aws_secret_key:
-            if not self.boto_profile:
-                sns_client = sns.connect_to_region(self.aws_region)
-            else:
-                sns_client = sns.connect_to_region(self.aws_region,
-                                                   profile_name=self.boto_profile)
-        else:
-            sns_client = sns.connect_to_region(self.aws_region,
-                                               aws_access_key_id=self.aws_access_key,
-                                               aws_secret_access_key=self.aws_secret_key)
-        sns_client.publish(self.sns_topic_arn, body, subject=self.create_title(matches))
+        session = boto3.Session(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            region_name=self.aws_region,
+            profile_name=self.profile
+        )
+        sns_client = session.client('sns')
+        sns_client.publish(
+            TopicArn=self.sns_topic_arn,
+            Message=body,
+            Subject=self.create_title(matches)
+        )
         elastalert_logger.info("Sent sns notification to %s" % (self.sns_topic_arn))
 
 
@@ -867,6 +961,22 @@ class HipChatAlerter(Alerter):
         try:
             if self.hipchat_ignore_ssl_errors:
                 requests.packages.urllib3.disable_warnings()
+
+            if self.rule.get('hipchat_mentions', []):
+                ping_users = self.rule.get('hipchat_mentions', [])
+                ping_msg = payload.copy()
+                ping_msg['message'] = "ping {}".format(
+                        ", ".join("@{}".format(user) for user in ping_users)
+                )
+                ping_msg['message_format'] = "text"
+
+                response = requests.post(
+                        self.url,
+                        data=json.dumps(ping_msg, cls=DateTimeEncoder),
+                        headers=headers,
+                        verify=not self.hipchat_ignore_ssl_errors,
+                        proxies=proxies)
+
             response = requests.post(self.url, data=json.dumps(payload, cls=DateTimeEncoder), headers=headers,
                                      verify=not self.hipchat_ignore_ssl_errors,
                                      proxies=proxies)
@@ -879,6 +989,58 @@ class HipChatAlerter(Alerter):
     def get_info(self):
         return {'type': 'hipchat',
                 'hipchat_room_id': self.hipchat_room_id}
+
+
+class MsTeamsAlerter(Alerter):
+    """ Creates a Microsoft Teams Conversation Message for each alert """
+    required_options = frozenset(['ms_teams_webhook_url', 'ms_teams_alert_summary'])
+
+    def __init__(self, rule):
+        super(MsTeamsAlerter, self).__init__(rule)
+        self.ms_teams_webhook_url = self.rule['ms_teams_webhook_url']
+        if isinstance(self.ms_teams_webhook_url, basestring):
+            self.ms_teams_webhook_url = [self.ms_teams_webhook_url]
+        self.ms_teams_proxy = self.rule.get('ms_teams_proxy', None)
+        self.ms_teams_alert_summary = self.rule.get('ms_teams_alert_summary', 'ElastAlert Message')
+        self.ms_teams_alert_fixed_width = self.rule.get('ms_teams_alert_fixed_width', False)
+        self.ms_teams_theme_color = self.rule.get('ms_teams_theme_color', '')
+
+    def format_body(self, body):
+        body = body.encode('UTF-8')
+        if self.ms_teams_alert_fixed_width:
+            body = body.replace('`', "'")
+            body = "```{0}```".format('```\n\n```'.join(x for x in body.split('\n'))).replace('\n``````', '')
+        return body
+
+    def alert(self, matches):
+        body = self.create_alert_body(matches)
+
+        body = self.format_body(body)
+        # post to Teams
+        headers = {'content-type': 'application/json'}
+        # set https proxy, if it was provided
+        proxies = {'https': self.ms_teams_proxy} if self.ms_teams_proxy else None
+        payload = {
+            '@type': 'MessageCard',
+            '@context': 'http://schema.org/extensions',
+            'summary': self.ms_teams_alert_summary,
+            'title': self.create_title(matches),
+            'text': body
+        }
+        if self.ms_teams_theme_color != '':
+            payload['themeColor'] = self.ms_teams_theme_color
+
+        for url in self.ms_teams_webhook_url:
+            try:
+                response = requests.post(url, data=json.dumps(payload, cls=DateTimeEncoder), headers=headers, proxies=proxies)
+                response.raise_for_status()
+            except RequestException as e:
+                raise EAException("Error posting to ms teams: %s" % e)
+        elastalert_logger.info("Alert sent to MS Teams")
+
+    def get_info(self):
+        return {'type': 'ms_teams',
+                'ms_teams_webhook_url': self.ms_teams_webhook_url}
 
 
 class SlackAlerter(Alerter):
@@ -901,11 +1063,18 @@ class SlackAlerter(Alerter):
 
     def format_body(self, body):
         # https://api.slack.com/docs/formatting
-        body = body.encode('UTF-8')
-        body = body.replace('&', '&amp;')
-        body = body.replace('<', '&lt;')
-        body = body.replace('>', '&gt;')
-        return body
+        return body.encode('UTF-8')
+
+    def get_aggregation_summary_text__maximum_width(self):
+        width = super(SlackAlerter, self).get_aggregation_summary_text__maximum_width()
+        # Reduced maximum width for prettier Slack display.
+        return min(width, 75)
+
+    def get_aggregation_summary_text(self, matches):
+        text = super(SlackAlerter, self).get_aggregation_summary_text(matches)
+        if text:
+            text = u'```\n{0}```\n'.format(text)
+        return text
 
     def alert(self, matches):
         body = self.create_alert_body(matches)
@@ -925,6 +1094,7 @@ class SlackAlerter(Alerter):
                     'color': self.slack_msg_color,
                     'title': self.create_title(matches),
                     'text': body,
+                    'mrkdwn_in': ['text', 'pretext'],
                     'fields': []
                 }
             ]
@@ -957,6 +1127,8 @@ class PagerDutyAlerter(Alerter):
         self.pagerduty_service_key = self.rule['pagerduty_service_key']
         self.pagerduty_client_name = self.rule['pagerduty_client_name']
         self.pagerduty_incident_key = self.rule.get('pagerduty_incident_key', '')
+        self.pagerduty_incident_key_args = self.rule.get('pagerduty_incident_key_args', None)
+        self.pagerduty_event_type = self.rule.get('pagerduty_event_type', 'trigger')
         self.pagerduty_proxy = self.rule.get('pagerduty_proxy', None)
         self.url = 'https://events.pagerduty.com/generic/2010-04-15/create_event.json'
 
@@ -967,9 +1139,9 @@ class PagerDutyAlerter(Alerter):
         headers = {'content-type': 'application/json'}
         payload = {
             'service_key': self.pagerduty_service_key,
-            'description': self.rule['name'],
-            'event_type': 'trigger',
-            'incident_key': self.pagerduty_incident_key,
+            'description': self.create_title(matches),
+            'event_type': self.pagerduty_event_type,
+            'incident_key': self.get_incident_key(matches),
             'client': self.pagerduty_client_name,
             'details': {
                 "information": body.encode('UTF-8'),
@@ -979,34 +1151,89 @@ class PagerDutyAlerter(Alerter):
         # set https proxy, if it was provided
         proxies = {'https': self.pagerduty_proxy} if self.pagerduty_proxy else None
         try:
-            response = requests.post(self.url, data=json.dumps(payload, cls=DateTimeEncoder, ensure_ascii=False), headers=headers, proxies=proxies)
+            response = requests.post(
+                self.url,
+                data=json.dumps(payload, cls=DateTimeEncoder, ensure_ascii=False),
+                headers=headers,
+                proxies=proxies
+            )
             response.raise_for_status()
         except RequestException as e:
             raise EAException("Error posting to pagerduty: %s" % e)
-        elastalert_logger.info("Trigger sent to PagerDuty")
+
+        if self.pagerduty_event_type == 'trigger':
+            elastalert_logger.info("Trigger sent to PagerDuty")
+        elif self.pagerduty_event_type == 'resolve':
+            elastalert_logger.info("Resolve sent to PagerDuty")
+        elif self.pagerduty_event_type == 'acknowledge':
+            elastalert_logger.info("acknowledge sent to PagerDuty")
+
+    def get_incident_key(self, matches):
+        if self.pagerduty_incident_key_args:
+            incident_key_values = [lookup_es_key(matches[0], arg) for arg in self.pagerduty_incident_key_args]
+
+            # Populate values with rule level properties too
+            for i in range(len(incident_key_values)):
+                if incident_key_values[i] is None:
+                    key_value = self.rule.get(self.pagerduty_incident_key_args[i])
+                    if key_value:
+                        incident_key_values[i] = key_value
+
+            missing = self.rule.get('alert_missing_value', '<MISSING VALUE>')
+            incident_key_values = [missing if val is None else val for val in incident_key_values]
+            return self.pagerduty_incident_key.format(*incident_key_values)
+        else:
+            return self.pagerduty_incident_key
 
     def get_info(self):
         return {'type': 'pagerduty',
                 'pagerduty_client_name': self.pagerduty_client_name}
 
 
+class ExotelAlerter(Alerter):
+    required_options = frozenset(['exotel_account_sid', 'exotel_auth_token', 'exotel_to_number', 'exotel_from_number'])
+
+    def __init__(self, rule):
+        super(ExotelAlerter, self).__init__(rule)
+        self.exotel_account_sid = self.rule['exotel_account_sid']
+        self.exotel_auth_token = self.rule['exotel_auth_token']
+        self.exotel_to_number = self.rule['exotel_to_number']
+        self.exotel_from_number = self.rule['exotel_from_number']
+        self.sms_body = self.rule.get('exotel_message_body', '')
+
+    def alert(self, matches):
+        client = Exotel(self.exotel_account_sid, self.exotel_auth_token)
+
+        try:
+            message_body = self.rule['name'] + self.sms_body
+            response = client.sms(self.rule['exotel_from_number'], self.rule['exotel_to_number'], message_body)
+            if response != 200:
+                raise EAException("Error posting to Exotel, response code is %s" % response)
+        except RequestException:
+            raise EAException("Error posting to Exotel"), None, sys.exc_info()[2]
+        elastalert_logger.info("Trigger sent to Exotel")
+
+    def get_info(self):
+        return {'type': 'exotel', 'exotel_account': self.exotel_account_sid}
+
+
 class TwilioAlerter(Alerter):
-    required_options = frozenset(['twilio_accout_sid', 'twilio_auth_token', 'twilio_to_number', 'twilio_from_number'])
+    required_options = frozenset(['twilio_account_sid', 'twilio_auth_token', 'twilio_to_number', 'twilio_from_number'])
 
     def __init__(self, rule):
         super(TwilioAlerter, self).__init__(rule)
-        self.twilio_accout_sid = self.rule['twilio_accout_sid']
+        self.twilio_account_sid = self.rule['twilio_account_sid']
         self.twilio_auth_token = self.rule['twilio_auth_token']
         self.twilio_to_number = self.rule['twilio_to_number']
         self.twilio_from_number = self.rule['twilio_from_number']
 
     def alert(self, matches):
-        client = TwilioRestClient(self.twilio_accout_sid, self.twilio_auth_token)
+        client = TwilioClient(self.twilio_account_sid, self.twilio_auth_token)
 
         try:
             client.messages.create(body=self.rule['name'],
                                    to=self.twilio_to_number,
-                                   from_=self.twilio_to_number)
+                                   from_=self.twilio_from_number)
 
         except TwilioRestException as e:
             raise EAException("Error posting to twilio: %s" % e)
@@ -1027,6 +1254,7 @@ class VictorOpsAlerter(Alerter):
         self.victorops_api_key = self.rule['victorops_api_key']
         self.victorops_routing_key = self.rule['victorops_routing_key']
         self.victorops_message_type = self.rule['victorops_message_type']
+        self.victorops_entity_id = self.rule.get('victorops_entity_id', None)
         self.victorops_entity_display_name = self.rule.get('victorops_entity_display_name', 'no entity display name')
         self.url = 'https://alert.victorops.com/integrations/generic/20131114/alert/%s/%s' % (
             self.victorops_api_key, self.victorops_routing_key)
@@ -1045,6 +1273,8 @@ class VictorOpsAlerter(Alerter):
             "monitoring_tool": "ElastAlert",
             "state_message": body
         }
+        if self.victorops_entity_id:
+            payload["entity_id"] = self.victorops_entity_id
 
         try:
             response = requests.post(self.url, data=json.dumps(payload, cls=DateTimeEncoder), headers=headers, proxies=proxies)
@@ -1077,6 +1307,8 @@ class TelegramAlerter(Alerter):
             # Separate text of aggregated alerts with dashes
             if len(matches) > 1:
                 body += '\n----------------------------------------\n'
+        if len(body) > 4095:
+            body = body[0:4000] + "\n⚠ *message was cropped according to telegram limits!* ⚠"
         body += u' ```'
 
         headers = {'content-type': 'application/json'}
@@ -1094,7 +1326,7 @@ class TelegramAlerter(Alerter):
             warnings.resetwarnings()
             response.raise_for_status()
         except RequestException as e:
-            raise EAException("Error posting to Telegram: %s" % e)
+            raise EAException("Error posting to Telegram: %s. Details: %s" % (e, "" if e.response is None else e.response.text))
 
         elastalert_logger.info(
             "Alert sent to Telegram room %s" % self.telegram_room_id)
@@ -1140,10 +1372,21 @@ class GitterAlerter(Alerter):
 
 class ServiceNowAlerter(Alerter):
     """ Creates a ServiceNow alert """
-    required_options = set(['username', 'password', 'servicenow_rest_url', 'short_description', 'comments', 'assignment_group', 'category', 'subcategory', 'cmdb_ci', 'caller_id'])
+    required_options = set([
+        'username',
+        'password',
+        'servicenow_rest_url',
+        'short_description',
+        'comments',
+        'assignment_group',
+        'category',
+        'subcategory',
+        'cmdb_ci',
+        'caller_id'
+    ])
 
     def __init__(self, rule):
-        super(GitterAlerter, self).__init__(rule)
+        super(ServiceNowAlerter, self).__init__(rule)
         self.servicenow_rest_url = self.rule['servicenow_rest_url']
         self.servicenow_proxy = self.rule.get('servicenow_proxy', None)
 
@@ -1169,7 +1412,13 @@ class ServiceNowAlerter(Alerter):
             "caller_id": self.rule["caller_id"]
         }
         try:
-            response = requests.post(self.servicenow_rest_url, auth=(self.rule['username'], self.rule['password']), headers=headers, data=json.dumps(payload, cls=DateTimeEncoder), proxies=proxies)
+            response = requests.post(
+                self.servicenow_rest_url,
+                auth=(self.rule['username'], self.rule['password']),
+                headers=headers,
+                data=json.dumps(payload, cls=DateTimeEncoder),
+                proxies=proxies
+            )
             response.raise_for_status()
         except RequestException as e:
             raise EAException("Error posting to ServiceNow: %s" % e)
@@ -1178,3 +1427,136 @@ class ServiceNowAlerter(Alerter):
     def get_info(self):
         return {'type': 'ServiceNow',
                 'self.servicenow_rest_url': self.servicenow_rest_url}
+
+
+class HTTPPostAlerter(Alerter):
+    """ Requested elasticsearch indices are sent by HTTP POST. Encoded with JSON. """
+
+    def __init__(self, rule):
+        super(HTTPPostAlerter, self).__init__(rule)
+        post_url = self.rule.get('http_post_url')
+        if isinstance(post_url, basestring):
+            post_url = [post_url]
+        self.post_url = post_url
+        self.post_proxy = self.rule.get('http_post_proxy')
+        self.post_payload = self.rule.get('http_post_payload', {})
+        self.post_static_payload = self.rule.get('http_post_static_payload', {})
+        self.post_all_values = self.rule.get('http_post_all_values', not self.post_payload)
+
+    def alert(self, matches):
+        """ Each match will trigger a POST to the specified endpoint(s). """
+        for match in matches:
+            payload = match if self.post_all_values else {}
+            payload.update(self.post_static_payload)
+            for post_key, es_key in self.post_payload.items():
+                payload[post_key] = lookup_es_key(match, es_key)
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json;charset=utf-8"
+            }
+            proxies = {'https': self.post_proxy} if self.post_proxy else None
+            for url in self.post_url:
+                try:
+                    response = requests.post(url, data=json.dumps(payload, cls=DateTimeEncoder),
+                                             headers=headers, proxies=proxies)
+                    response.raise_for_status()
+                except RequestException as e:
+                    raise EAException("Error posting HTTP Post alert: %s" % e)
+            elastalert_logger.info("HTTP Post alert sent.")
+
+    def get_info(self):
+        return {'type': 'http_post',
+                'http_post_webhook_url': self.post_url}
+
+
+class StrideHTMLParser(HTMLParser):
+    """Parse html into stride's fabric structure"""
+
+    def __init__(self):
+        """
+        Define a couple markup place holders.
+        """
+        self.content = []
+        self.mark = None
+        HTMLParser.__init__(self)
+
+    def handle_starttag(self, tag, attrs):
+        """Identify and verify starting tag is fabric compatible."""
+        if tag == 'b' or tag == 'strong':
+            self.mark = dict(type='strong')
+        if tag == 'u':
+            self.mark = dict(type='underline')
+        if tag == 'a':
+            self.mark = dict(type='link', attrs=dict(attrs))
+
+    def handle_endtag(self, tag):
+        """Clear mark on endtag."""
+        self.mark = None
+
+    def handle_data(self, data):
+        """Construct data node for our data."""
+        node = dict(type='text', text=data)
+        if self.mark:
+            node['marks'] = [self.mark]
+        self.content.append(node)
+
+
+class StrideAlerter(Alerter):
+    """ Creates a Stride conversation message for each alert """
+
+    required_options = frozenset(
+        ['stride_access_token', 'stride_cloud_id', 'stride_converstation_id'])
+
+    def __init__(self, rule):
+        super(StrideAlerter, self).__init__(rule)
+
+        self.stride_access_token = self.rule['stride_access_token']
+        self.stride_cloud_id = self.rule['stride_cloud_id']
+        self.stride_converstation_id = self.rule['stride_converstation_id']
+        self.stride_ignore_ssl_errors = self.rule.get('stride_ignore_ssl_errors', False)
+        self.stride_proxy = self.rule.get('stride_proxy', None)
+        self.url = 'https://api.atlassian.com/site/%s/conversation/%s/message' % (
+            self.stride_cloud_id, self.stride_converstation_id)
+
+    def alert(self, matches):
+        body = self.create_alert_body(matches).strip()
+
+        # parse body with StrideHTMLParser
+        parser = StrideHTMLParser()
+        parser.feed(body)
+
+        # Post to Stride
+        headers = {
+            'content-type': 'application/json',
+            'Authorization': 'Bearer {}'.format(self.stride_access_token)
+        }
+
+        # set https proxy, if it was provided
+        proxies = {'https': self.stride_proxy} if self.stride_proxy else None
+
+        # build stride json payload
+        # https://developer.atlassian.com/cloud/stride/apis/document/structure/
+        payload = {'body': {'version': 1, 'type': "doc", 'content': [
+            {'type': "panel", 'attrs': {'panelType': "warning"}, 'content': [
+                {'type': 'paragraph', 'content': parser.content}
+            ]}
+        ]}}
+
+        try:
+            if self.stride_ignore_ssl_errors:
+                requests.packages.urllib3.disable_warnings()
+            response = requests.post(
+                self.url, data=json.dumps(payload, cls=DateTimeEncoder),
+                headers=headers, verify=not self.stride_ignore_ssl_errors,
+                proxies=proxies)
+            warnings.resetwarnings()
+            response.raise_for_status()
+        except RequestException as e:
+            raise EAException("Error posting to Stride: %s" % e)
+        elastalert_logger.info(
+            "Alert sent to Stride converstation %s" % self.stride_converstation_id)
+
+    def get_info(self):
+        return {'type': 'stride',
+                'stride_cloud_id': self.stride_cloud_id,
+                'stride_converstation_id': self.stride_converstation_id}

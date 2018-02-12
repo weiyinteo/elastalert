@@ -25,7 +25,7 @@ definitions:
 
   filter: &filter {}
 
-required: [name, type, index, alert]
+required: [type, index, alert]
 type: object
 
 ### Rule Types section
@@ -38,14 +38,14 @@ oneOf:
     required: [blacklist, compare_key]
     properties:
       type: {enum: [blacklist]}
-      compare_key: {type: string}
+      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
       blacklist: {type: array, items: {type: string}}
 
   - title: Whitelist
     required: [whitelist, compare_key, ignore_null]
     properties:
       type: {enum: [whitelist]}
-      compare_key: {type: string}
+      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
       whitelist: {type: array, items: {type: string}}
       ignore_null: {type: boolean}
 
@@ -53,7 +53,7 @@ oneOf:
     required: [query_key, compare_key, ignore_null]
     properties:
       type: {enum: [change]}
-      compare_key: {type: string}
+      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
       ignore_null: {type: boolean}
       timeframe: *timeframe
 
@@ -112,6 +112,18 @@ oneOf:
       cardinality_field: {type: string}
       timeframe: *timeframe
 
+  - title: Metric Aggregation
+    required: [metric_agg_key,metric_agg_type]
+    properties:
+      type: {enum: [metric_aggregation]}
+      metric_agg_type: {enum: ["min", "max", "avg", "sum", "cardinality", "value_count"]}
+      #timeframe: *timeframe
+
+  - title: Percentage Match
+    required: [match_bucket_filter]
+    properties:
+      type: {enum: [percentage_match]}
+
   - title: Custom Rule from Module
     properties:
       # custom rules include a period in the rule type
@@ -132,6 +144,7 @@ properties:
   use_strftime_index: {type: boolean}
 
   # Optional Settings
+  import: {type: string}
   aggregation: *timeframe
   realert: *timeframe
   exponential_realert: *timeframe
@@ -166,7 +179,8 @@ properties:
   alert_text: {type: string} # Python format string
   alert_text_args: {type: array, items: {type: string}}
   alert_text_kw: {type: object}
-  alert_text_type: {enum: [alert_text_only, exclude_fields]}
+  alert_text_type: {enum: [alert_text_only, exclude_fields, aggregation_summary_only]}
+  alert_missing_value: {type: string}
   timestamp_field: {type: string}
   field: {}
 
@@ -201,11 +215,18 @@ properties:
 
   ### HipChat
   hipchat_auth_token: {type: string}
-  hipchat_room_id: {type: string}
+  hipchat_room_id: {type: [string, integer]}
   hipchat_domain: {type: string}
   hipchat_ignore_ssl_errors: {type: boolean}
   hipchat_notify: {type: boolean}
   hipchat_from: {type: string}
+  hipchat_mentions: {type: array, items: {type: string}}
+
+  ### Stride
+  stride_access_token: {type: string}
+  stride_cloud_id: {type: string}
+  stride_converstation_id: {type: string}
+  stride_ignore_ssl_errors: {type: boolean}
 
   ### Slack
   slack_webhook_url: *arrayOfString
@@ -219,9 +240,16 @@ properties:
   ### PagerDuty
   pagerduty_service_key: {type: string}
   pagerduty_client_name: {type: string}
+  pagerduty_event_type: {enum: [none, trigger, resolve, acknowledge]}
+
+  ### Exotel
+  exotel_account_sid: {type: string}
+  exotel_auth_token: {type: string}
+  exotel_to_number: {type: string}
+  exotel_from_number: {type: string}
 
   ### Twilio
-  twilio_accout_sid: {type: string}
+  twilio_account_sid: {type: string}
   twilio_auth_token: {type: string}
   twilio_to_number: {type: string}
   twilio_from_number: {type: string}
@@ -230,6 +258,7 @@ properties:
   victorops_api_key: {type: string}
   victorops_routing_key: {type: string}
   victorops_message_type: {enum: [INFO, WARNING, ACKNOWLEDGEMENT, CRITICAL, RECOVERY]}
+  victorops_entity_id: {type: string}
   victorops_entity_display_name: {type: string}
 
   ### Telegram
@@ -241,3 +270,7 @@ properties:
   gitter_webhook_url: {type: string}
   gitter_proxy: {type: string}
   gitter_msg_level: {enum: [info, error]}
+
+  ### Simple
+  simple_webhook_url: *arrayOfString
+  simple_proxy: {type: string}

@@ -3,17 +3,23 @@ import copy
 import datetime
 
 import mock
+import pytest
 
 from elastalert.ruletypes import AnyRule
+from elastalert.ruletypes import BaseAggregationRule
 from elastalert.ruletypes import BlacklistRule
 from elastalert.ruletypes import CardinalityRule
 from elastalert.ruletypes import ChangeRule
 from elastalert.ruletypes import EventWindow
 from elastalert.ruletypes import FlatlineRule
 from elastalert.ruletypes import FrequencyRule
+from elastalert.ruletypes import MetricAggregationRule
 from elastalert.ruletypes import NewTermsRule
+from elastalert.ruletypes import PercentageMatchRule
 from elastalert.ruletypes import SpikeRule
 from elastalert.ruletypes import WhitelistRule
+from elastalert.util import dt_to_ts
+from elastalert.util import EAException
 from elastalert.util import ts_now
 from elastalert.util import ts_to_dt
 
@@ -34,11 +40,32 @@ def create_event(timestamp, timestamp_field='@timestamp', **kwargs):
     return event
 
 
+def create_bucket_aggregation(agg_name, buckets):
+    agg = {agg_name: {'buckets': buckets}}
+    return agg
+
+
+def create_percentage_match_agg(match_count, other_count):
+    agg = create_bucket_aggregation(
+        'percentage_match_aggs', {
+            'match_bucket': {
+                'doc_count': match_count
+            },
+            '_other_': {
+                'doc_count': other_count
+            }
+        }
+    )
+    return agg
+
+
 def assert_matches_have(matches, terms):
     assert len(matches) == len(terms)
     for match, term in zip(matches, terms):
         assert term[0] in match
         assert match[term[0]] == term[1]
+        if len(term) > 2:
+            assert match[term[2]] == term[3]
 
 
 def test_any():
@@ -380,6 +407,58 @@ def test_spike_terms():
     assert rule.matches[0]['username'] == 'userD'
 
 
+def test_spike_terms_query_key_alert_on_new_data():
+    rules = {'spike_height': 1.5,
+             'timeframe': datetime.timedelta(minutes=10),
+             'spike_type': 'both',
+             'use_count_query': False,
+             'timestamp_field': 'ts',
+             'query_key': 'username',
+             'use_term_query': True,
+             'alert_on_new_data': True}
+
+    terms1 = {ts_to_dt('2014-01-01T00:01:00Z'): [{'key': 'userA', 'doc_count': 10}]}
+    terms2 = {ts_to_dt('2014-01-01T00:06:00Z'): [{'key': 'userA', 'doc_count': 10}]}
+    terms3 = {ts_to_dt('2014-01-01T00:11:00Z'): [{'key': 'userA', 'doc_count': 10}]}
+    terms4 = {ts_to_dt('2014-01-01T00:21:00Z'): [{'key': 'userA', 'doc_count': 20}]}
+    terms5 = {ts_to_dt('2014-01-01T00:26:00Z'): [{'key': 'userA', 'doc_count': 20}]}
+    terms6 = {ts_to_dt('2014-01-01T00:31:00Z'): [{'key': 'userA', 'doc_count': 20}]}
+    terms7 = {ts_to_dt('2014-01-01T00:36:00Z'): [{'key': 'userA', 'doc_count': 20}]}
+    terms8 = {ts_to_dt('2014-01-01T00:41:00Z'): [{'key': 'userA', 'doc_count': 20}]}
+
+    rule = SpikeRule(rules)
+
+    # Initial input
+    rule.add_terms_data(terms1)
+    assert len(rule.matches) == 0
+
+    # No spike for UserA because windows not filled
+    rule.add_terms_data(terms2)
+    assert len(rule.matches) == 0
+
+    rule.add_terms_data(terms3)
+    assert len(rule.matches) == 0
+
+    rule.add_terms_data(terms4)
+    assert len(rule.matches) == 0
+
+    # Spike
+    rule.add_terms_data(terms5)
+    assert len(rule.matches) == 1
+
+    rule.matches[:] = []
+
+    # There will be no more spikes since all terms have the same doc_count
+    rule.add_terms_data(terms6)
+    assert len(rule.matches) == 0
+
+    rule.add_terms_data(terms7)
+    assert len(rule.matches) == 0
+
+    rule.add_terms_data(terms8)
+    assert len(rule.matches) == 0
+
+
 def test_blacklist():
     events = [{'@timestamp': ts_to_dt('2014-09-26T12:34:56Z'), 'term': 'good'},
               {'@timestamp': ts_to_dt('2014-09-26T12:34:57Z'), 'term': 'bad'},
@@ -426,36 +505,39 @@ def test_whitelist_dont_ignore_nulls():
 
 
 def test_change():
-    events = hits(10, username='qlo', term='good')
+    events = hits(10, username='qlo', term='good', second_term='yes')
     events[8].pop('term')
+    events[8].pop('second_term')
     events[9]['term'] = 'bad'
-    rules = {'compare_key': 'term',
+    events[9]['second_term'] = 'no'
+    rules = {'compound_compare_key': ['term', 'second_term'],
              'query_key': 'username',
              'ignore_null': True,
              'timestamp_field': '@timestamp'}
     rule = ChangeRule(rules)
     rule.add_data(events)
-    assert_matches_have(rule.matches, [('term', 'bad')])
+    assert_matches_have(rule.matches, [('term', 'bad', 'second_term', 'no')])
 
     # Unhashable QK
-    events2 = hits(10, username=['qlo'], term='good')
+    events2 = hits(10, username=['qlo'], term='good', second_term='yes')
     events2[9]['term'] = 'bad'
+    events2[9]['second_term'] = 'no'
     rule = ChangeRule(rules)
     rule.add_data(events2)
-    assert_matches_have(rule.matches, [('term', 'bad')])
+    assert_matches_have(rule.matches, [('term', 'bad', 'second_term', 'no')])
 
     # Don't ignore nulls
     rules['ignore_null'] = False
     rule = ChangeRule(rules)
     rule.add_data(events)
-    assert_matches_have(rule.matches, [('username', 'qlo'), ('term', 'bad')])
+    assert_matches_have(rule.matches, [('username', 'qlo'), ('term', 'bad', 'second_term', 'no')])
 
     # With timeframe
     rules['timeframe'] = datetime.timedelta(seconds=2)
     rules['ignore_null'] = True
     rule = ChangeRule(rules)
     rule.add_data(events)
-    assert_matches_have(rule.matches, [('term', 'bad')])
+    assert_matches_have(rule.matches, [('term', 'bad', 'second_term', 'no')])
 
     # With timeframe, doesn't match
     events = events[:8] + events[9:]
@@ -468,13 +550,15 @@ def test_change():
 def test_new_term():
     rules = {'fields': ['a', 'b'],
              'timestamp_field': '@timestamp',
-             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash'}
+             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash',
+             'ts_to_dt': ts_to_dt, 'dt_to_ts': dt_to_ts}
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
 
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         call_args = []
 
         # search is called with a mutable dict containing timestamps, this is required to test
@@ -526,6 +610,7 @@ def test_new_term():
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         rule = NewTermsRule(rules)
     rule.add_data([{'@timestamp': ts_now(), 'a': 'key2'}])
     assert len(rule.matches) == 1
@@ -536,12 +621,14 @@ def test_new_term_nested_field():
 
     rules = {'fields': ['a', 'b.c'],
              'timestamp_field': '@timestamp',
-             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash'}
+             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash',
+             'ts_to_dt': ts_to_dt, 'dt_to_ts': dt_to_ts}
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         rule = NewTermsRule(rules)
 
         assert rule.es.search.call_count == 60
@@ -558,13 +645,15 @@ def test_new_term_with_terms():
     rules = {'fields': ['a'],
              'timestamp_field': '@timestamp',
              'es_host': 'example.com', 'es_port': 10, 'index': 'logstash', 'query_key': 'a',
-             'window_step_size': {'days': 2}}
+             'window_step_size': {'days': 2},
+             'ts_to_dt': ts_to_dt, 'dt_to_ts': dt_to_ts}
     mock_res = {'aggregations': {'filtered': {'values': {'buckets': [{'key': 'key1', 'doc_count': 1},
                                                                      {'key': 'key2', 'doc_count': 5}]}}}}
 
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         rule = NewTermsRule(rules)
 
         # Only 15 queries because of custom step size
@@ -593,7 +682,8 @@ def test_new_term_with_terms():
 def test_new_term_with_composite_fields():
     rules = {'fields': [['a', 'b', 'c'], ['d', 'e.f']],
              'timestamp_field': '@timestamp',
-             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash'}
+             'es_host': 'example.com', 'es_port': 10, 'index': 'logstash',
+             'ts_to_dt': ts_to_dt, 'dt_to_ts': dt_to_ts}
 
     mock_res = {
         'aggregations': {
@@ -633,6 +723,7 @@ def test_new_term_with_composite_fields():
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         rule = NewTermsRule(rules)
 
         assert rule.es.search.call_count == 60
@@ -669,6 +760,7 @@ def test_new_term_with_composite_fields():
     with mock.patch('elastalert.ruletypes.elasticsearch_client') as mock_es:
         mock_es.return_value = mock.Mock()
         mock_es.return_value.search.return_value = mock_res
+        mock_es.return_value.info.return_value = {'version': {'number': '2.x.x'}}
         rule = NewTermsRule(rules)
     rule.add_data([{'@timestamp': ts_now(), 'a': 'key2'}])
     assert len(rule.matches) == 2
@@ -784,6 +876,34 @@ def test_flatline_query_key():
     rule.garbage_collect(ts_to_dt(timestamp))
     assert len(rule.matches) == 5
     assert set(['key1', 'key2', 'key3']) == set([m['key'] for m in rule.matches if m['@timestamp'] == timestamp])
+
+
+def test_flatline_forget_query_key():
+    rules = {'timeframe': datetime.timedelta(seconds=30),
+             'threshold': 1,
+             'query_key': 'qk',
+             'forget_keys': True,
+             'timestamp_field': '@timestamp'}
+
+    rule = FlatlineRule(rules)
+
+    # Adding two separate query keys, the flatline rule should trigger for both
+    rule.add_data(hits(1, qk='key1'))
+    assert rule.matches == []
+
+    # This will be run at the end of the hits
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:00:11Z'))
+    assert rule.matches == []
+
+    # Key1 should not alert
+    timestamp = '2014-09-26T12:00:45Z'
+    rule.garbage_collect(ts_to_dt(timestamp))
+    assert len(rule.matches) == 1
+    rule.matches = []
+
+    # key1 was forgotten, so no more matches
+    rule.garbage_collect(ts_to_dt('2014-09-26T12:01:11Z'))
+    assert rule.matches == []
 
 
 def test_cardinality_max():
@@ -922,3 +1042,199 @@ def test_cardinality_nested_cardinality_field():
         event = {'@timestamp': datetime.datetime.now() + datetime.timedelta(minutes=15), 'd': {'ip': ip}}
         rule.add_data([event])
         assert len(rule.matches) == 0
+
+
+def test_base_aggregation_constructor():
+    rules = {'bucket_interval_timedelta': datetime.timedelta(seconds=10),
+             'buffer_time': datetime.timedelta(minutes=1),
+             'timestamp_field': '@timestamp'}
+
+    # Test time period constructor logic
+    rules['bucket_interval'] = {'seconds': 10}
+    rule = BaseAggregationRule(rules)
+    assert rule.rules['bucket_interval_period'] == '10s'
+
+    rules['bucket_interval'] = {'minutes': 5}
+    rule = BaseAggregationRule(rules)
+    assert rule.rules['bucket_interval_period'] == '5m'
+
+    rules['bucket_interval'] = {'hours': 4}
+    rule = BaseAggregationRule(rules)
+    assert rule.rules['bucket_interval_period'] == '4h'
+
+    rules['bucket_interval'] = {'days': 2}
+    rule = BaseAggregationRule(rules)
+    assert rule.rules['bucket_interval_period'] == '2d'
+
+    rules['bucket_interval'] = {'weeks': 1}
+    rule = BaseAggregationRule(rules)
+    assert rule.rules['bucket_interval_period'] == '1w'
+
+    # buffer_time evenly divisible by bucket_interval
+    with pytest.raises(EAException):
+        rules['bucket_interval_timedelta'] = datetime.timedelta(seconds=13)
+        rule = BaseAggregationRule(rules)
+
+    # run_every evenly divisible by bucket_interval
+    rules['use_run_every_query_size'] = True
+    rules['run_every'] = datetime.timedelta(minutes=2)
+    rules['bucket_interval_timedelta'] = datetime.timedelta(seconds=10)
+    rule = BaseAggregationRule(rules)
+
+    with pytest.raises(EAException):
+        rules['bucket_interval_timedelta'] = datetime.timedelta(seconds=13)
+        rule = BaseAggregationRule(rules)
+
+
+def test_base_aggregation_payloads():
+    with mock.patch.object(BaseAggregationRule, 'check_matches', return_value=None) as mock_check_matches:
+        rules = {'bucket_interval': {'seconds': 10},
+                 'bucket_interval_timedelta': datetime.timedelta(seconds=10),
+                 'buffer_time': datetime.timedelta(minutes=5),
+                 'timestamp_field': '@timestamp'}
+
+        timestamp = datetime.datetime.now()
+        interval_agg = create_bucket_aggregation('interval_aggs', [{'key_as_string': '2014-01-01T00:00:00Z'}])
+        rule = BaseAggregationRule(rules)
+
+        # Payload not wrapped
+        rule.add_aggregation_data({timestamp: {}})
+        mock_check_matches.assert_called_once_with(timestamp, None, {})
+        mock_check_matches.reset_mock()
+
+        # Payload wrapped by date_histogram
+        interval_agg_data = {timestamp: interval_agg}
+        rule.add_aggregation_data(interval_agg_data)
+        mock_check_matches.assert_called_once_with(ts_to_dt('2014-01-01T00:00:00Z'), None, {'key_as_string': '2014-01-01T00:00:00Z'})
+        mock_check_matches.reset_mock()
+
+        # Payload wrapped by terms
+        bucket_agg_data = {timestamp: create_bucket_aggregation('bucket_aggs', [{'key': 'qk'}])}
+        rule.add_aggregation_data(bucket_agg_data)
+        mock_check_matches.assert_called_once_with(timestamp, 'qk', {'key': 'qk'})
+        mock_check_matches.reset_mock()
+
+        # Payload wrapped by terms and date_histogram
+        bucket_interval_agg_data = {
+            timestamp: create_bucket_aggregation('bucket_aggs', [{'key': 'qk', 'interval_aggs': interval_agg['interval_aggs']}])
+        }
+        rule.add_aggregation_data(bucket_interval_agg_data)
+        mock_check_matches.assert_called_once_with(ts_to_dt('2014-01-01T00:00:00Z'), 'qk', {'key_as_string': '2014-01-01T00:00:00Z'})
+        mock_check_matches.reset_mock()
+
+
+def test_metric_aggregation():
+    rules = {'buffer_time': datetime.timedelta(minutes=5),
+             'timestamp_field': '@timestamp',
+             'metric_agg_type': 'avg',
+             'metric_agg_key': 'cpu_pct'}
+
+    # Check threshold logic
+    with pytest.raises(EAException):
+        rule = MetricAggregationRule(rules)
+
+    rules['min_threshold'] = 0.1
+    rules['max_threshold'] = 0.8
+
+    rule = MetricAggregationRule(rules)
+
+    assert rule.rules['aggregation_query_element'] == {'cpu_pct_avg': {'avg': {'field': 'cpu_pct'}}}
+
+    assert rule.crossed_thresholds(None) is False
+    assert rule.crossed_thresholds(0.09) is True
+    assert rule.crossed_thresholds(0.10) is False
+    assert rule.crossed_thresholds(0.79) is False
+    assert rule.crossed_thresholds(0.81) is True
+
+    rule.check_matches(datetime.datetime.now(), None, {'cpu_pct_avg': {'value': None}})
+    rule.check_matches(datetime.datetime.now(), None, {'cpu_pct_avg': {'value': 0.5}})
+    assert len(rule.matches) == 0
+
+    rule.check_matches(datetime.datetime.now(), None, {'cpu_pct_avg': {'value': 0.05}})
+    rule.check_matches(datetime.datetime.now(), None, {'cpu_pct_avg': {'value': 0.95}})
+    assert len(rule.matches) == 2
+
+    rules['query_key'] = 'qk'
+    rule = MetricAggregationRule(rules)
+    rule.check_matches(datetime.datetime.now(), 'qk_val', {'cpu_pct_avg': {'value': 0.95}})
+    assert rule.matches[0]['qk'] == 'qk_val'
+
+
+def test_metric_aggregation_complex_query_key():
+    rules = {'buffer_time': datetime.timedelta(minutes=5),
+             'timestamp_field': '@timestamp',
+             'metric_agg_type': 'avg',
+             'metric_agg_key': 'cpu_pct',
+             'compound_query_key': ['qk', 'sub_qk'],
+             'query_key': 'qk,sub_qk',
+             'max_threshold': 0.8}
+
+    query = {"bucket_aggs": {"buckets": [
+        {"cpu_pct_avg": {"value": 0.91}, "key": "sub_qk_val1"},
+        {"cpu_pct_avg": {"value": 0.95}, "key": "sub_qk_val2"},
+        {"cpu_pct_avg": {"value": 0.89}, "key": "sub_qk_val3"}]
+    }, "key": "qk_val"}
+
+    rule = MetricAggregationRule(rules)
+    rule.check_matches(datetime.datetime.now(), 'qk_val', query)
+    assert len(rule.matches) == 3
+    assert rule.matches[0]['qk'] == 'qk_val'
+    assert rule.matches[1]['qk'] == 'qk_val'
+    assert rule.matches[0]['sub_qk'] == 'sub_qk_val1'
+    assert rule.matches[1]['sub_qk'] == 'sub_qk_val2'
+
+
+def test_percentage_match():
+    rules = {'match_bucket_filter': {'term': 'term_val'},
+             'buffer_time': datetime.timedelta(minutes=5),
+             'timestamp_field': '@timestamp'}
+
+    # Check threshold logic
+    with pytest.raises(EAException):
+        rule = PercentageMatchRule(rules)
+
+    rules['min_percentage'] = 25
+    rules['max_percentage'] = 75
+    rule = PercentageMatchRule(rules)
+
+    assert rule.rules['aggregation_query_element'] == {
+        'percentage_match_aggs': {
+            'filters': {
+                'other_bucket': True,
+                'filters': {
+                    'match_bucket': {
+                        'bool': {
+                            'must': {
+                                'term': 'term_val'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert rule.percentage_violation(25) is False
+    assert rule.percentage_violation(50) is False
+    assert rule.percentage_violation(75) is False
+    assert rule.percentage_violation(24.9) is True
+    assert rule.percentage_violation(75.1) is True
+
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(0, 0))
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(None, 100))
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(26, 74))
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(74, 26))
+
+    assert len(rule.matches) == 0
+
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(24, 76))
+    rule.check_matches(datetime.datetime.now(), None, create_percentage_match_agg(76, 24))
+    assert len(rule.matches) == 2
+
+    rules['query_key'] = 'qk'
+    rule = PercentageMatchRule(rules)
+    rule.check_matches(datetime.datetime.now(), 'qk_val', create_percentage_match_agg(76.666666667, 24))
+    assert rule.matches[0]['qk'] == 'qk_val'
+    assert '76.1589403974' in rule.get_match_str(rule.matches[0])
+    rules['percentage_format_string'] = '%.2f'
+    assert '76.16' in rule.get_match_str(rule.matches[0])
